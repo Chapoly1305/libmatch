@@ -4,6 +4,18 @@ LibMatch is a proof-of-concept tool for matching object files to binary executab
 
 This tool is meant to go with, and was developed along-side HALucinator(https://github.com/embedded-sec/halucinator) and hal-fuzz (https://github.com/ucsb-seclab/hal-fuzz)
 
+## Recent Updates (2026)
+
+This project has been modernized to use the latest angr version:
+
+- **Python 3.10-3.11** required (was Python 2/3) - Note: Python 3.12+ not yet supported due to autoblob dependency
+- **angr 9.2.192+** (latest as of January 2026)
+- **Updated dependencies**: networkx 3.x, PyYAML 6.x
+- **Modernized Docker setup** using Python 3.11-slim base image
+- **Fixed typos** and improved code robustness
+
+The core angr APIs used (CFGFast, project loading, VEX lifting) remain compatible, so existing databases and workflows should continue to work.
+
 ## Installing
 
 *EDG notes: This is a proof-of-concept, it uses tons of RAM and isn't the world's most efficient tool.  It does get the job done, and we've used it on real firmware successfully, it just needs a little refactoring before I'd say it's ready for prime-time.*
@@ -24,10 +36,27 @@ docker run -it libmatch /bin/bash
 
 ### Manual setup
 
-First, get angr(https://angr.horse/ )
-I suggest using the angr-dev package to do so (https://github.com/angr/angr-dev/ )
+**Requirements:**
+- Python 3.10 or 3.11 (3.12+ not yet supported due to autoblob)
+- angr 9.2.192+ (https://angr.io/)
+- autoblob - Custom CLE Loader (https://github.com/subwire/autoblob/)
 
-You'll also need autoblob, a CLE Loader that I wrote which helps with some binary blob loading (https://github.com/subwire/autoblob/ ) 
+**Installation:**
+
+```bash
+# Install from PyPI
+pip install angr>=9.2.192
+
+# Install autoblob
+git clone https://github.com/subwire/autoblob
+cd autoblob
+pip install -e .
+
+# Install libmatch
+cd /path/to/libmatch
+pip install -r requirements.txt
+pip install -e .
+``` 
 
 ## Usage
 

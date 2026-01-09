@@ -1,0 +1,14 @@
+# Core dependency - angr binary analysis framework
+angr>=9.2.192
+
+# Graph analysis for call graphs
+networkx>=3.0
+
+# YAML output format
+PyYAML>=6.0
+
+# ELF file creation
+makeelf>=0.3.0
+
+# Colored terminal output
+clint>=0.5.1

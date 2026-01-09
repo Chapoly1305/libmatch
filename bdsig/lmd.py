@@ -35,7 +35,7 @@ class NormalizedBlock(object):
             targets = function.call_sites[block.addr]
             for blk, target in self.call_targets:
                 if project.loader.extern_object.contains_addr(target):
-                    target = project.laoder.find_symbol(target).name
+                    target = project.loader.find_symbol(target).name
                 self.call_targets.append((blk, target))
         self.jumpkind = None
 
@@ -220,14 +220,27 @@ class LibMatchDescriptor(object):
     Serializes easily into a (relatively) small blob.
     """
     def __init__(self, proj, banned_names=("$d", "$t")):
-        self.cfg = proj.analyses.CFGFast(force_complete_scan=False, 
-                resolve_indirect_jumps=True, 
+        self.cfg = proj.analyses.CFGFast(force_complete_scan=False,
+                resolve_indirect_jumps=True,
                 normalize=True,
                 cross_references=True,
                 detect_tail_calls=True)
         self.callgraph = self.cfg.kb.callgraph
-        self._sim_procedures = {addr: (sp.library_name or "_UNKNOWN_LIB") + ":" + sp.display_name
-                                for addr, sp in proj._sim_procedures.items()}
+
+        # Build a map of hooked addresses to their SimProcedure names
+        # We need to save this for later since the project won't be serialized
+        self._sim_procedures = {}
+        try:
+            # Try using private attribute for efficiency (still present in angr 9.2+)
+            self._sim_procedures = {addr: (sp.library_name or "_UNKNOWN_LIB") + ":" + sp.display_name
+                                    for addr, sp in proj._sim_procedures.items()}
+        except AttributeError:
+            # Fallback: iterate through functions and check using public API
+            for faddr in self.cfg.kb.functions:
+                if proj.is_hooked(faddr):
+                    sp = proj.hooked_by(faddr)
+                    if sp:
+                        self._sim_procedures[faddr] = (sp.library_name or "_UNKNOWN_LIB") + ":" + sp.display_name
 
         self.banned_addrs = set()
         self.normalized_functions = {}
@@ -254,7 +267,9 @@ class LibMatchDescriptor(object):
         for faddr in self.cfg.kb.functions:
             f = self.cfg.kb.functions.function(faddr)
             f._project = None
-            f._block_cache = {}
+            # Clear block cache if it exists (for serializability)
+            if hasattr(f, '_block_cache'):
+                f._block_cache = {}
 
         self.function_manager = self.cfg.kb.functions.copy()
         self.function_manager._kb = None

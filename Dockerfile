@@ -1,15 +1,42 @@
 ## -*- docker-image-name: "libmatch" -*-
-FROM angr/angr
-MAINTAINER edg@cs.ucsb.edu
-RUN apt-get update && apt-get install -y sudo automake virtualenvwrapper python3-pip python3-dev python-dev build-essential libxml2-dev \
-                      libxslt1-dev git libffi-dev cmake libreadline-dev libtool debootstrap debian-archive-keyring \
-                      libglib2.0-dev libpixman-1-dev screen binutils-multiarch nasm vim libssl-dev 
-USER angr
-RUN git clone https://github.com/subwire/autoblob /home/angr/angr-dev/autoblob
-RUN bash -c "source /usr/share/virtualenvwrapper/virtualenvwrapper.sh && workon angr && cd /home/angr/angr-dev/autoblob && pip install -e ."
-COPY --chown=angr . /home/angr/angr-dev/libmatch
-RUN bash -c "source /usr/share/virtualenvwrapper/virtualenvwrapper.sh && workon angr && cd /home/angr/angr-dev/libmatch && pip install -e ."
+FROM python:3.11-slim
 
-WORKDIR /home/angr/angr-dev/libmatch
+LABEL maintainer="edg@cs.ucsb.edu"
+LABEL description="LibMatch - Binary library function matcher using angr"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    libffi-dev \
+    libssl-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    binutils-multiarch \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create working directory
+WORKDIR /app
+
+# Install autoblob (custom CLE loader)
+RUN git clone https://github.com/subwire/autoblob /tmp/autoblob && \
+    cd /tmp/autoblob && \
+    pip install --no-cache-dir . && \
+    cd / && rm -rf /tmp/autoblob
+
+# Copy requirements first for better Docker layer caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Install libmatch in development mode
+RUN pip install --no-cache-dir -e .
+
+# Set working directory
+WORKDIR /app
 
 
