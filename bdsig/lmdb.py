@@ -100,7 +100,7 @@ class LibMatchDatabase(object):
         if score:
             print("############### UNREFINED MATCHES ###############")
             score_matches(lmd_path, plain_candidates, self)
-            input()
+            print()  # Empty line for readability
             print("############### FINAL MATCHES ###############")
             score_matches(lmd_path, candidates, self)
 

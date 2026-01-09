@@ -475,8 +475,19 @@ class FunctionDiff(object):
         :param function:    A normalized Function object.
         :returns:           A dictionary of basic block addresses and their distance to the start of the function.
         """
+        startpoint = function.startpoint
+
+        # Check if startpoint is in the graph (it may have been merged during normalization)
+        if startpoint not in function.graph.nodes():
+            # Try to find the startpoint in merged_blocks
+            if hasattr(function, 'merged_blocks') and startpoint in function.merged_blocks:
+                startpoint = function.merged_blocks[startpoint]
+            else:
+                # Fallback: return empty dict (blocks will get default distance of 10000)
+                return {}
+
         return networkx.single_source_shortest_path_length(function.graph,
-                                                           function.startpoint)
+                                                           startpoint)
 
     @staticmethod
     def _distances_from_function_exit(function):
