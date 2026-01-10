@@ -210,7 +210,9 @@ class NormalizedFunction(object):
             if self.orig_function.endpoints_with_type['transition']:
                 for tt in self.orig_function.endpoints_with_type['transition']:
                     if tt.addr == n.addr:
-                        call_targets.append(tt.successors()[0].addr)
+                        succs = tt.successors()
+                        if succs:
+                            call_targets.append(succs[0].addr)
             if len(call_targets) > 0:
                 self.call_sites[n] = call_targets
 
