@@ -398,6 +398,57 @@ def compare_statement_dict(statement_1, statement_2):
     return differences
 
 
+class FunctionDiffResult:
+    """
+    Lightweight result object that stores only the data needed after Phase 2.
+    This prevents memory leaks by not retaining full NormalizedFunction objects.
+
+    Memory: ~2-3 KB vs ~14 MB for full FunctionDiff
+    """
+    __slots__ = ['similarity_score', 'probably_identical',
+                 'function_a_name', 'function_a_addr', 'function_a_call_sites',
+                 'function_b_name', 'function_b_addr', 'function_b_call_sites',
+                 '_block_matches']
+
+    def __init__(self, fd):
+        """Create lightweight result from FunctionDiff."""
+        self.similarity_score = fd.similarity_score
+        self.probably_identical = fd.probably_identical
+        self._block_matches = fd._block_matches
+
+        # Copy only needed data from function_a
+        self.function_a_name = fd.function_a.name
+        self.function_a_addr = fd.function_a.addr
+        # Deep copy call_sites to break reference
+        self.function_a_call_sites = {k: list(v) for k, v in fd.function_a.call_sites.items()}
+
+        # Copy only needed data from function_b
+        self.function_b_name = fd.function_b.name
+        self.function_b_addr = fd.function_b.addr
+        # Deep copy call_sites to break reference
+        self.function_b_call_sites = {k: list(v) for k, v in fd.function_b.call_sites.items()}
+
+    @property
+    def function_a(self):
+        """Compatibility wrapper for function_a access."""
+        return _FunctionProxy(self.function_a_name, self.function_a_addr, self.function_a_call_sites)
+
+    @property
+    def function_b(self):
+        """Compatibility wrapper for function_b access."""
+        return _FunctionProxy(self.function_b_name, self.function_b_addr, self.function_b_call_sites)
+
+
+class _FunctionProxy:
+    """Lightweight proxy that mimics NormalizedFunction interface."""
+    __slots__ = ['name', 'addr', 'call_sites']
+
+    def __init__(self, name, addr, call_sites):
+        self.name = name
+        self.addr = addr
+        self.call_sites = call_sites
+
+
 class FunctionDiff(object):
     """
     This class computes the a diff between two functions.

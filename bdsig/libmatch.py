@@ -6,7 +6,7 @@ import psutil
 from multiprocessing import Pool
 from .iocg import InterObjectCallgraph
 from .lmd import LibMatchDescriptor
-from .functiondiff import FunctionDiff
+from .functiondiff import FunctionDiff, FunctionDiffResult
 from collections import defaultdict
 
 l = logging.getLogger("bdsig.libmatch")
@@ -199,7 +199,9 @@ def _compute_function_diff_worker(args):
         lib_func = lib_lmd.normalized_functions[lib_faddr]
         fd = FunctionDiff(_binary_lmd, lib_lmd, bin_func, lib_func)
         if fd.probably_identical:
-            return (binary_faddr, lib_faddr, fd, lmd_id)
+            # Return lightweight FunctionDiffResult (~2-3KB) instead of FunctionDiff (~14MB)
+            # This prevents memory leak in multiprocessing by breaking references to NormalizedFunction
+            return (binary_faddr, lib_faddr, FunctionDiffResult(fd), lmd_id)
         return None
     except Exception as e:
         l.error(f"Error processing function pair ({binary_faddr:#08x}, {lib_faddr:#08x}): {e}")
