@@ -2,7 +2,13 @@ import cle
 import logging
 import pickle
 import os
+import time
 import angr
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 from angr.errors import SimEngineError, SimMemoryError
 from pyvex.lifting.gym.arm_spotter import *
 from .iocg import InterObjectCallgraph
@@ -10,6 +16,18 @@ from .iocg import InterObjectCallgraph
 
 l = logging.getLogger("bdsig.lmd")
 l.setLevel("DEBUG")
+
+
+def _log_perf(label, start_time=None, extra=""):
+    """Log performance info for LMD operations."""
+    if HAS_PSUTIL:
+        mem = psutil.Process().memory_info()
+        mem_gb = mem.rss / (1024 * 1024 * 1024)
+        if start_time:
+            elapsed = time.time() - start_time
+            l.info(f"[LMD-PERF] {label}: {elapsed:.2f}s | Mem: {mem_gb:.2f} GB {extra}")
+        else:
+            l.info(f"[LMD-PERF] {label} | Mem: {mem_gb:.2f} GB {extra}")
 
 
 class NormalizedBlock(object):
@@ -220,12 +238,20 @@ class LibMatchDescriptor(object):
     Serializes easily into a (relatively) small blob.
     """
     def __init__(self, proj, banned_names=("$d", "$t")):
+        _log_perf("LMD init started")
+        total_start = time.time()
+
+        # CFG Analysis
+        cfg_start = time.time()
+        l.info("[LMD-PERF] Starting CFG analysis...")
         self.cfg = proj.analyses.CFGFast(force_complete_scan=False,
                 resolve_indirect_jumps=True,
                 normalize=True,
                 cross_references=True,
                 detect_tail_calls=True)
         self.callgraph = self.cfg.kb.callgraph
+        num_functions = len(self.cfg.kb.functions)
+        _log_perf("CFG analysis", cfg_start, f"| Functions: {num_functions:,}")
 
         # Build a map of hooked addresses to their SimProcedure names
         # We need to save this for later since the project won't be serialized
@@ -248,6 +274,9 @@ class LibMatchDescriptor(object):
         self.ordered_successors = {}
         self.filename = proj.filename
 
+        # Normalize functions
+        norm_func_start = time.time()
+        l.info("[LMD-PERF] Normalizing functions...")
         for faddr in self.cfg.kb.functions:
             f = self.cfg.kb.functions.function(faddr)
             self.normalized_functions[f.addr] = NormalizedFunction(proj, f)
@@ -256,13 +285,20 @@ class LibMatchDescriptor(object):
                     self.normalized_blocks[(f.addr, b.addr)] = NormalizedBlock(proj, b, self.normalized_functions[f.addr])
                 except (SimMemoryError, SimEngineError):
                     self.normalized_blocks[(f.addr, b.addr)] = None
+        _log_perf("Normalize functions", norm_func_start, f"| Funcs: {len(self.normalized_functions):,} | Blocks: {len(self.normalized_blocks):,}")
 
+        # Compute ordered successors
+        succ_start = time.time()
         for norm_f in self.normalized_functions.values():
             for b in norm_f.graph.nodes():
                 ord_succ = self._get_ordered_successors(proj, b, norm_f.graph.successors(b))
                 self.ordered_successors[(norm_f.addr, b.addr)] = ord_succ
+        _log_perf("Ordered successors", succ_start)
 
+        # Compute function attributes
+        attr_start = time.time()
         self.function_attributes = self._compute_function_attributes()
+        _log_perf("Function attributes", attr_start, f"| Attributes: {len(self.function_attributes):,}")
 
         for faddr in self.cfg.kb.functions:
             f = self.cfg.kb.functions.function(faddr)
@@ -301,6 +337,9 @@ class LibMatchDescriptor(object):
                 self.viable_symbols.add(sym)
         proj.loader.close()
         del proj.loader
+
+        # Log total initialization time
+        _log_perf("LMD init complete", total_start, f"| Viable funcs: {len(self.viable_functions):,} | Viable symbols: {len(self.viable_symbols):,}")
         
     def is_trivial(self, proj, f):
         """
@@ -327,6 +366,22 @@ class LibMatchDescriptor(object):
 
     def is_hooked(self, addr):
         return addr in self._sim_procedures
+
+    def release_cfg(self):
+        """
+        Release CFG memory after initialization.
+        Call this after all normalized structures are built.
+        Saves ~5-7GB per LMD.
+
+        The CFG is only used during __init__ to build normalized functions,
+        blocks, and compute attributes. After that, it's dead weight.
+        """
+        if hasattr(self, 'cfg') and self.cfg is not None:
+            del self.cfg
+            self.cfg = None
+        if hasattr(self, 'callgraph') and self.callgraph is not None:
+            del self.callgraph
+            self.callgraph = None
 
     def _compute_function_attributes(self):
         """

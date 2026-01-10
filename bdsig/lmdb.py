@@ -2,7 +2,13 @@ import networkx
 import logging
 import pickle
 import os
+import time
 import angr
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 from collections import defaultdict
 from .lmd import LibMatchDescriptor
 from .utils import PROJECT_KWARGS
@@ -11,6 +17,18 @@ from .utils import score_matches
 
 l = logging.getLogger("bdsig.lmdb")
 l.setLevel("DEBUG")
+
+
+def _log_perf(label, start_time=None, extra=""):
+    """Log performance info for LMDB operations."""
+    if HAS_PSUTIL:
+        mem = psutil.Process().memory_info()
+        mem_gb = mem.rss / (1024 * 1024 * 1024)
+        if start_time:
+            elapsed = time.time() - start_time
+            l.info(f"[LMDB-PERF] {label}: {elapsed:.2f}s | Mem: {mem_gb:.2f} GB {extra}")
+        else:
+            l.info(f"[LMDB-PERF] {label} | Mem: {mem_gb:.2f} GB {extra}")
 
 class LibMatchDatabase(object):
     """
@@ -81,13 +99,21 @@ class LibMatchDatabase(object):
         :param lib: Either a string (program path) or a LibMatchDescriptor
         :return: A dictionary of addresses in the program to possible symbols.
         """
+        match_start = time.time()
+        _log_perf("Match started")
+
         if isinstance(lmd_path, LibMatchDescriptor):
             lmd = lmd_path
         else:
+            load_start = time.time()
             lmd = LibMatchDescriptor.load_path(lmd_path)
+            _log_perf("LMD loaded", load_start)
+
         candidates = []
         try:
+            libmatch_start = time.time()
             self.lm = LibMatch(lmd, self)
+            _log_perf("LibMatch computation", libmatch_start)
             candidates = self.lm._candidate_matches
             plain_candidates = self.lm._plain_matches
         except Exception as e:
@@ -95,6 +121,7 @@ class LibMatchDatabase(object):
             raise
         # TODO: This is where we put multi-library heuristics!
 
+        postprocess_start = time.time()
         candidates = self._smoosh(candidates)
         plain_candidates = self._smoosh(plain_candidates)
         if score:
@@ -105,6 +132,8 @@ class LibMatchDatabase(object):
             score_matches(lmd_path, candidates, self)
 
         out = self._postprocess_matches(lmd, candidates)
+        _log_perf("Post-processing", postprocess_start, f"| Final matches: {len(out):,}")
+        _log_perf("Match complete", match_start, f"| Total symbols matched: {len(out):,}")
         return out
 
     # Creation and Serialization
@@ -164,6 +193,20 @@ class LibMatchDatabase(object):
                 names = {x.name for x in lmd.viable_symbols}
                 syms.update(names)
         self.symbol_names = syms
+
+    def release_all_cfgs(self):
+        """
+        Release CFG memory from all library LMDs in this database.
+        Call this after loading to reduce memory usage.
+        Saves ~5-7GB per LMD.
+        """
+        released = 0
+        for lib_name, lmd_list in self.lib_lmds.items():
+            for lmd in lmd_list:
+                if hasattr(lmd, 'release_cfg'):
+                    lmd.release_cfg()
+                    released += 1
+        l.info(f"Released CFG memory from {released} library LMDs")
 
     @staticmethod
     def load_path(p):

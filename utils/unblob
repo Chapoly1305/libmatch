@@ -2,6 +2,14 @@
 import yaml
 import makeelf
 import argparse
+import sys
+import struct
+import time
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 from bdsig.utils import collect_best_matches_for_library
 from bdsig.lmdb import LibMatchDatabase
 from bdsig.lmd import LibMatchDescriptor
@@ -11,6 +19,69 @@ import angr
 import os
 
 log = logging.getLogger('unblob')
+
+
+class OverallPerformanceTracker:
+    """Track overall performance for the unblob pipeline."""
+
+    def __init__(self):
+        self.start_time = time.time()
+        self.stages = {}
+        if HAS_PSUTIL:
+            self.start_cpu = psutil.Process().cpu_times()
+
+    def start_stage(self, name):
+        """Start timing a stage."""
+        mem_gb = 0
+        if HAS_PSUTIL:
+            mem_gb = psutil.Process().memory_info().rss / (1024**3)
+        self.stages[name] = {
+            'start': time.time(),
+            'end': None,
+            'duration': None,
+            'start_mem_gb': mem_gb,
+        }
+        log.info(f"[STAGE] {name} started | Mem: {mem_gb:.2f} GB")
+
+    def end_stage(self, name, extra=""):
+        """End timing a stage."""
+        if name not in self.stages:
+            return
+        stage = self.stages[name]
+        stage['end'] = time.time()
+        stage['duration'] = stage['end'] - stage['start']
+        mem_gb = 0
+        if HAS_PSUTIL:
+            mem_gb = psutil.Process().memory_info().rss / (1024**3)
+        stage['end_mem_gb'] = mem_gb
+        log.info(f"[STAGE] {name} completed: {stage['duration']:.2f}s | Mem: {mem_gb:.2f} GB {extra}")
+
+    def print_summary(self):
+        """Print overall performance summary."""
+        total_time = time.time() - self.start_time
+        log.info("=" * 70)
+        log.info("OVERALL PERFORMANCE SUMMARY")
+        log.info("=" * 70)
+        log.info(f"Total wall time: {total_time:.2f}s ({total_time/60:.2f} min)")
+
+        if HAS_PSUTIL:
+            cpu_times = psutil.Process().cpu_times()
+            total_cpu = (cpu_times.user - self.start_cpu.user) + (cpu_times.system - self.start_cpu.system)
+            log.info(f"Total CPU time: {total_cpu:.2f}s")
+            log.info(f"CPU efficiency: {100*total_cpu/total_time:.1f}%")
+            mem_gb = psutil.Process().memory_info().rss / (1024**3)
+            log.info(f"Final memory: {mem_gb:.2f} GB")
+
+        log.info("-" * 70)
+        log.info(f"{'Stage':<30} {'Duration':>12} {'Start Mem':>12} {'End Mem':>12}")
+        log.info("-" * 70)
+        for name, stage in self.stages.items():
+            if stage['duration'] is not None:
+                duration_str = f"{stage['duration']:.2f}s"
+                start_mem = f"{stage.get('start_mem_gb', 0):.2f} GB"
+                end_mem = f"{stage.get('end_mem_gb', 0):.2f} GB"
+                log.info(f"{name:<30} {duration_str:>12} {start_mem:>12} {end_mem:>12}")
+        log.info("=" * 70)
 
 def parse_opts():
     parser = argparse.ArgumentParser()
@@ -102,7 +173,11 @@ def make_yaml(project, symbol_map, opts):
 
 
 def do_normal(opts):
+    # Initialize performance tracker
+    perf = OverallPerformanceTracker()
+
     # Dissect the binary.
+    perf.start_stage("Binary loading")
     if not opts.base_address or not opts.entry_point or not opts.arch:
         # We have some work to do....
         if opts.cortex:
@@ -117,6 +192,7 @@ def do_normal(opts):
     opts.arch = project.arch
     opts.base_address = project.loader.main_object.min_addr
     opts.entry_point = project.entry
+    perf.end_stage("Binary loading")
 
     log.info("################")
     log.info("Detected architecture: %s" % project.arch.name)
@@ -126,18 +202,42 @@ def do_normal(opts):
     # Now do symbol recovery
     symbol_map = None
     if not opts.disable_symbol_recovery:
+        # Load LMDB
+        perf.start_stage("LMDB loading")
         log.info("Loading LMDB from %s" % opts.lmdb)
         lmdb = LibMatchDatabase.load_path(opts.lmdb)
+        # Release CFG memory from library LMDs (saves ~5-7GB per LMD)
+        lmdb.release_all_cfgs()
+        # Count library stats
+        num_libs = len(lmdb.lib_lmds)
+        num_objects = sum(len(lmds) for lmds in lmdb.lib_lmds.values())
+        perf.end_stage("LMDB loading", f"| Libs: {num_libs}, Objects: {num_objects}")
+
+        # Build target LMD
+        perf.start_stage("Target CFG analysis")
         log.info("Processing target binary")
         lmd = LibMatchDescriptor(project)
+        # Release CFG memory from target LMD after initialization
+        lmd.release_cfg()
+        num_funcs = len(lmd.viable_functions)
+        perf.end_stage("Target CFG analysis", f"| Functions: {num_funcs:,}")
+
+        # Symbol recovery
+        perf.start_stage("Symbol recovery")
         log.info("Beginning symbol recovery")
         symbol_map = lmdb.match(lmd, score=opts.scoring)
+        perf.end_stage("Symbol recovery", f"| Matched: {len(symbol_map):,}")
 
     # Create the output
+    perf.start_stage("Output generation")
     if opts.elf:
         make_elf(project, symbol_map, opts)
     elif opts.yaml:
         make_yaml(project, symbol_map, opts)
+    perf.end_stage("Output generation")
+
+    # Print final summary
+    perf.print_summary()
 
 
 def do_build(opts):
