@@ -161,7 +161,9 @@ def _log_memory_usage(label=""):
 
 # Configuration for parallelization
 USE_PARALLEL = os.environ.get('LIBMATCH_PARALLEL', '1') == '1'
-NUM_WORKERS = int(os.environ.get('LIBMATCH_WORKERS', '20'))
+# Auto-detect worker count based on CPU cores (default: min of 16 or CPU count)
+_default_workers = min(16, os.cpu_count() or 8)
+NUM_WORKERS = int(os.environ.get('LIBMATCH_WORKERS', str(_default_workers)))
 
 # Global references for worker processes (set during worker init)
 # This avoids pickling large LMD objects for every work item
@@ -317,7 +319,10 @@ class LibMatch(object):
             return
 
         # Calculate optimal chunk size
-        chunk_size = max(1, len(work_items) // (NUM_WORKERS * 4))
+        # Smaller chunks for better load balancing (was NUM_WORKERS * 4)
+        # More chunks = more even distribution when function complexity varies
+        # With 14M items and 16 workers: ~8,750 chunks of ~1,600 items each
+        chunk_size = max(100, min(2000, len(work_items) // (NUM_WORKERS * 100)))
 
         l.info(f"Phase 2: Processing {len(work_items)} function pairs with {NUM_WORKERS} workers (chunk_size={chunk_size})")
         _log_memory_usage("Before Pool creation")
@@ -395,7 +400,7 @@ class LibMatch(object):
                 self._narrow_third_order(f_addr, matches)
 
     def _compute_fourth_order(self):
-        self.recursion_list = []
+        self.recursion_set = set()  # Issue #5: Use set for O(1) membership test and removal
         good_hits = []
         for f_addr, matches in self._candidate_matches.items():
             if len(matches) == 1:
@@ -428,20 +433,20 @@ class LibMatch(object):
                 return
         self._candidate_matches[func] = [matches[0]]
 
-    recursion_list = []
+    recursion_set = set()  # Issue #5: Use set for O(1) membership test and removal
 
     def _narrow_third_order(self, f_addr, matches, exact_narrowing=False):
         # TODO: FIXME:
         # It's possible that you get a single match, and this match is good, but it's wrong, due to function call targets.
         # Maybe we should check everything, even if it has more than one match.
         # No match is better than one wrong one!
-        if f_addr in self.recursion_list:
+        if f_addr in self.recursion_set:
             l.warning("Oof, recursion to %#08x!" % f_addr)
             return
-        self.recursion_list.append(f_addr)
+        self.recursion_set.add(f_addr)
         if len(matches) == 1:
             # Perfect match! cannot refine
-            self.recursion_list.remove(f_addr)
+            self.recursion_set.discard(f_addr)
             return
         l.info("Analyzing function %#08x" % f_addr)
         # Get the target for each candidate match
@@ -459,7 +464,7 @@ class LibMatch(object):
                 elif callee not in self._candidate_matches or len(self._candidate_matches[callee]) == 0:
                     l.error("Cannot disambiguate function at %#08x, unmatched call to %#08x" % (f_addr, callee))
                     self.ambiguous_funcs.append(f_addr)
-                    self.recursion_list.remove(f_addr)
+                    self.recursion_set.discard(f_addr)
                     return  # We're fucked
                 else:
                     callee_matches = self._candidate_matches[callee]
@@ -474,7 +479,7 @@ class LibMatch(object):
                         if exact_narrowing and len(self._candidate_matches[callee]) > 1:
                             l.error("Failed to narrow down call to %#08x" % callee)
                             self.ambiguous_funcs.append(f_addr)
-                            self.recursion_list.remove(f_addr)
+                            self.recursion_set.discard(f_addr)
                             return
                     possible_callees = set  ()
                     for cm in callee_matches:
@@ -527,7 +532,7 @@ class LibMatch(object):
             else:
                 self._candidate_matches[f_addr].append((lib_name, match_lmd, match_diff))
                 l.error("Resolved call to %#08x to %s via callgraph" % (f_addr, match_name))
-        self.recursion_list.remove(f_addr)
+        self.recursion_set.discard(f_addr)
 
     def _narrow_fourth_order(self, f_addr, matches):
         """
@@ -541,17 +546,17 @@ class LibMatch(object):
         :param matches:
         :return:
         """
-        if f_addr in self.recursion_list:
+        if f_addr in self.recursion_set:
             l.warning("Oof, recursion to %#08x!" % f_addr)
             return
-        self.recursion_list.append(f_addr)
+        self.recursion_set.add(f_addr)
         if len(matches) != 1:
-            self.recursion_list.remove(f_addr)
+            self.recursion_set.discard(f_addr)
             return
         m_lib, m_lmd, m_fd = matches[0]
         if isinstance(m_fd, str):
             # We've already been here
-            self.recursion_list.remove(f_addr)
+            self.recursion_set.discard(f_addr)
             return
         target_func = m_fd.function_a
         lib_func = m_fd.function_b
@@ -625,7 +630,7 @@ class LibMatch(object):
                         # Recurse, see if that helps any.
                         l.info("Recursively resolving %#08x" % targ_callee)
                         self._narrow_fourth_order(targ_callee, self._candidate_matches[targ_callee])
-        self.recursion_list.remove(f_addr)
+        self.recursion_set.discard(f_addr)
 
     def _dedup(self):
         """

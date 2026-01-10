@@ -359,6 +359,21 @@ class LibMatchDescriptor(object):
         self.function_attributes = self._compute_function_attributes()
         _log_perf("Function attributes", attr_start, f"| Attributes: {len(self.function_attributes):,}")
 
+        # Precompute block attributes for all functions (Issue #1 optimization)
+        # This eliminates O(V+E) graph traversals per FunctionDiff
+        block_attr_start = time.time()
+        self._block_attributes_cache = self._precompute_all_block_attributes()
+        _log_perf("Block attributes cache", block_attr_start, f"| Cached: {len(self._block_attributes_cache):,}")
+
+        # Build symbol address hash table (Issue #3 optimization)
+        # This converts O(n) symbol lookup to O(1)
+        self._addr_to_symbol = {}
+        for s in proj.loader.main_object.symbols:
+            self._addr_to_symbol[s.rebased_addr] = s
+        if proj.loader.extern_object:
+            for s in proj.loader.extern_object.symbols:
+                self._addr_to_symbol[s.rebased_addr] = s
+
         for faddr in self.cfg.kb.functions:
             f = self.cfg.kb.functions.function(faddr)
             f._project = None
@@ -493,11 +508,90 @@ class LibMatchDescriptor(object):
             return sorted(succ, key=lambda x:x.addr)
 
 
+    def _precompute_all_block_attributes(self):
+        """
+        Precompute block attributes for all functions during LMD initialization.
+        This avoids O(V+E) graph traversals for every FunctionDiff comparison.
+
+        Block attributes consist of:
+        - distance_from_start: BFS distance from function entry
+        - distance_from_exit: BFS distance from function exit(s)
+        - num_calls: number of call sites in the block
+        """
+        import networkx
+        cache = {}
+        for func_addr, norm_func in self.normalized_functions.items():
+            # Compute distances from start
+            distances_from_start = self._compute_distances_from_start(norm_func)
+            distances_from_exit = self._compute_distances_from_exit(norm_func)
+            call_sites = norm_func.call_sites
+
+            attributes = {}
+            for block in norm_func.graph.nodes():
+                if block in call_sites:
+                    number_of_subfunction_calls = len(call_sites[block])
+                else:
+                    number_of_subfunction_calls = 0
+                # Default distance for unreachable blocks
+                dist_start = distances_from_start.get(block, 10000)
+                dist_exit = distances_from_exit.get(block, 10000)
+                attributes[block] = (dist_start, dist_exit, number_of_subfunction_calls)
+
+            cache[func_addr] = attributes
+        return cache
+
+    def _compute_distances_from_start(self, function):
+        """Compute BFS distances from function start."""
+        import networkx
+        startpoint = function.startpoint
+        if startpoint not in function.graph.nodes():
+            if hasattr(function, 'merged_blocks') and startpoint in function.merged_blocks:
+                startpoint = function.merged_blocks[startpoint]
+            else:
+                return {}
+        return networkx.single_source_shortest_path_length(function.graph, startpoint)
+
+    def _compute_distances_from_exit(self, function):
+        """Compute BFS distances from function exit(s)."""
+        import networkx
+        reverse_graph = function.graph.reverse()
+        reverse_graph.add_node("start")
+        found_exits = False
+        for n in function.graph.nodes():
+            if len(list(function.graph.successors(n))) == 0:
+                reverse_graph.add_edge("start", n)
+                found_exits = True
+
+        if not found_exits:
+            last = max(function.graph.nodes(), key=lambda x: x.addr)
+            reverse_graph.add_edge("start", last)
+
+        dists = networkx.single_source_shortest_path_length(reverse_graph, "start")
+        del dists["start"]
+        for n in dists:
+            dists[n] -= 1
+        return dists
+
+    def get_block_attributes(self, func_addr):
+        """
+        Get precomputed block attributes for a function.
+        O(1) lookup instead of O(V+E) computation per FunctionDiff.
+
+        Returns None if cache doesn't exist (for backward compatibility with
+        LMDs created before this optimization was added).
+        """
+        if not hasattr(self, '_block_attributes_cache') or self._block_attributes_cache is None:
+            return None  # Signal to FunctionDiff to compute attributes itself
+        return self._block_attributes_cache.get(func_addr)
+
     def symbol_for_addr(self, addr):
+        """O(1) lookup for symbol at address using prebuilt hash table."""
+        if hasattr(self, '_addr_to_symbol'):
+            return self._addr_to_symbol.get(addr)
+        # Fallback for old LMD files without the hash table
         for s in self.loader.main_object.symbols:
             if s.rebased_addr == addr:
                 return s
-        # Also check the externs
         for s in self.loader.extern_object.symbols:
             if s.rebased_addr == addr:
                 return s

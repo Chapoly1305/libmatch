@@ -145,6 +145,84 @@ def _get_closest_matches(input_attributes, target_attributes):
     return _get_closest_matches_python(input_attributes, target_attributes)
 
 
+def _get_bidirectional_closest_matches(attributes_a, attributes_b):
+    """
+    Compute closest matches in BOTH directions using a single distance matrix.
+    This eliminates redundant distance computations (Issue #9 optimization).
+
+    :param attributes_a:    First dictionary of objects to attribute tuples.
+    :param attributes_b:    Second dictionary of blocks to attribute tuples.
+    :returns:               Tuple of (closest_a, closest_b) where:
+                            - closest_a: dict mapping each key in A to closest keys in B
+                            - closest_b: dict mapping each key in B to closest keys in A
+    """
+    if not attributes_a or not attributes_b:
+        return ({a: [] for a in attributes_a}, {b: [] for b in attributes_b})
+
+    keys_a = list(attributes_a.keys())
+    keys_b = list(attributes_b.keys())
+
+    if HAVE_SCIPY and len(keys_a) > 5 and len(keys_b) > 5:
+        # Vectorized version - compute distance matrix ONCE
+        vectors_a = np.array([attributes_a[k] for k in keys_a], dtype=np.float64)
+        vectors_b = np.array([attributes_b[k] for k in keys_b], dtype=np.float64)
+
+        # Compute all pairwise distances ONCE
+        dist_matrix = cdist(vectors_a, vectors_b, metric='euclidean')
+
+        # Extract closest_a (A→B): for each row, find columns with min distance
+        min_dists_a = dist_matrix.min(axis=1)
+        closest_a = {}
+        for i, a in enumerate(keys_a):
+            matches_mask = np.abs(dist_matrix[i] - min_dists_a[i]) < 1e-10
+            closest_a[a] = [keys_b[j] for j in np.where(matches_mask)[0]]
+
+        # Extract closest_b (B→A): for each column, find rows with min distance
+        min_dists_b = dist_matrix.min(axis=0)
+        closest_b = {}
+        for j, b in enumerate(keys_b):
+            matches_mask = np.abs(dist_matrix[:, j] - min_dists_b[j]) < 1e-10
+            closest_b[b] = [keys_a[i] for i in np.where(matches_mask)[0]]
+
+        return closest_a, closest_b
+    else:
+        # Pure Python version - compute distances once, store in dict
+        distances = {}
+        for a in keys_a:
+            for b in keys_b:
+                distances[(a, b)] = _euclidean_dist(attributes_a[a], attributes_b[b])
+
+        # Extract closest_a (A→B)
+        closest_a = {}
+        for a in keys_a:
+            best_dist = float('inf')
+            best_matches = []
+            for b in keys_b:
+                dist = distances[(a, b)]
+                if dist < best_dist:
+                    best_matches = [b]
+                    best_dist = dist
+                elif dist == best_dist:
+                    best_matches.append(b)
+            closest_a[a] = best_matches
+
+        # Extract closest_b (B→A)
+        closest_b = {}
+        for b in keys_b:
+            best_dist = float('inf')
+            best_matches = []
+            for a in keys_a:
+                dist = distances[(a, b)]
+                if dist < best_dist:
+                    best_matches = [a]
+                    best_dist = dist
+                elif dist == best_dist:
+                    best_matches.append(a)
+            closest_b[b] = best_matches
+
+        return closest_a, closest_b
+
+
 # from http://rosettacode.org/wiki/Levenshtein_distance
 def _levenshtein_distance(s1, s2):
     """
@@ -212,13 +290,17 @@ def _is_better_match(x, y, matched_a, matched_b, attributes_dict_a, attributes_d
     """
     attributes_x = attributes_dict_a[x]
     attributes_y = attributes_dict_b[y]
+
+    # Issue #8: Compute distance ONCE and reuse
+    dist_xy = _euclidean_dist(attributes_x, attributes_y)
+
     if x in matched_a:
         attributes_match = attributes_dict_b[matched_a[x]]
-        if _euclidean_dist(attributes_x, attributes_y) >= _euclidean_dist(attributes_x, attributes_match):
+        if dist_xy >= _euclidean_dist(attributes_x, attributes_match):
             return False
     if y in matched_b:
         attributes_match = attributes_dict_a[matched_b[y]]
-        if _euclidean_dist(attributes_x, attributes_y) >= _euclidean_dist(attributes_y, attributes_match):
+        if dist_xy >= _euclidean_dist(attributes_y, attributes_match):
             return False
     return True
 
@@ -332,13 +414,26 @@ class FunctionDiff(object):
         self.function_a = function_a
         self.function_b = function_b
 
-        self.attributes_a = self._compute_block_attributes(self.function_a)
-        self.attributes_b = self._compute_block_attributes(self.function_b)
+        # Use precomputed block attributes from LMD if available (Issue #1 optimization)
+        # This avoids O(V+E) graph traversals per FunctionDiff
+        # For backward compatibility, fall back to computing if cache doesn't exist
+        cached_a = lmd_a.get_block_attributes(function_a.addr) if hasattr(lmd_a, 'get_block_attributes') else None
+        if cached_a is not None:
+            self.attributes_a = cached_a
+        else:
+            self.attributes_a = self._compute_block_attributes(self.function_a)
+
+        cached_b = lmd_b.get_block_attributes(function_b.addr) if hasattr(lmd_b, 'get_block_attributes') else None
+        if cached_b is not None:
+            self.attributes_b = cached_b
+        else:
+            self.attributes_b = self._compute_block_attributes(self.function_b)
 
         self._block_matches = set()
         self._unmatched_blocks_from_a = set()
         self._unmatched_blocks_from_b = set()
         self._cached_similarity_score = None
+        self._similarity_cache = {}  # Issue #2: Cache for block_similarity()
 
         self._compute_diff()
 
@@ -453,21 +548,29 @@ class FunctionDiff(object):
         :returns:       The similarity of the basic blocks, normalized for the base address of the block and function
                         call addresses.
         """
+        # Issue #2: Check cache first (using block addresses as key)
+        cache_key = (block_a.addr, block_b.addr)
+        if cache_key in self._similarity_cache:
+            return self._similarity_cache[cache_key]
 
         # handle sim procedure blocks
         if self.lmd_a.is_hooked(block_a) and self.lmd_b.is_hooked(block_b):
             if self.lmd_a._sim_procedures[block_a] == self.lmd_b._sim_procedures[block_b]:
-                return 1.0
+                result = 1.0
             else:
-                return 0.0
+                result = 0.0
+            self._similarity_cache[cache_key] = result
+            return result
 
         block_a = self.lmd_a.normalized_blocks[(self.function_a.addr, block_a.addr)]
         block_b = self.lmd_b.normalized_blocks[(self.function_b.addr, block_b.addr)]
 
         # if both were None then they are assumed to be the same, if only one was the same they are assumed to differ
         if block_a is None and block_b is None:
+            self._similarity_cache[cache_key] = 1.0
             return 1.0
         elif block_a is None or block_b is None:
+            self._similarity_cache[cache_key] = 0.0
             return 0.0
 
         # get all elements for computing similarity
@@ -483,6 +586,7 @@ class FunctionDiff(object):
         # Early termination: Quick rejection for vastly different sizes
         max_tags_len = max(len(tags_a), len(tags_b))
         if abs(len(tags_a) - len(tags_b)) > max_tags_len * 0.5:
+            self._similarity_cache[cache_key] = 0.0
             return 0.0
 
         # Compute num_values upfront for early termination checks
@@ -493,6 +597,7 @@ class FunctionDiff(object):
 
         # Early termination: If num_values is 0, return 1.0 (identical empty blocks)
         if num_values == 0:
+            self._similarity_cache[cache_key] = 1.0
             return 1.0
 
         # Compute total distance with early termination
@@ -503,19 +608,23 @@ class FunctionDiff(object):
         # Compute distances incrementally with early exit
         total_dist += _levenshtein_distance(tags_a, tags_b)
         if total_dist > max_acceptable_dist:
+            self._similarity_cache[cache_key] = 0.0
             return 0.0
 
         total_dist += _levenshtein_distance(block_a.operations, block_b.operations)
         if total_dist > max_acceptable_dist:
+            self._similarity_cache[cache_key] = 0.0
             return 0.0
 
         total_dist += _levenshtein_distance(all_registers_a, all_registers_b)
         if total_dist > max_acceptable_dist:
+            self._similarity_cache[cache_key] = 0.0
             return 0.0
 
         acceptable_differences = self._get_acceptable_constant_differences(block_a, block_b)
         total_dist += _normalized_levenshtein_distance(consts_a, consts_b, acceptable_differences)
         if total_dist > max_acceptable_dist:
+            self._similarity_cache[cache_key] = 0.0
             return 0.0
 
         total_dist += 0 if jumpkind_a == jumpkind_b else 1
@@ -523,6 +632,7 @@ class FunctionDiff(object):
         # compute similarity
         similarity = 1 - (float(total_dist) / num_values)
 
+        self._similarity_cache[cache_key] = similarity
         return similarity
 
     def blocks_probably_identical(self, block_a, block_b, check_constants=False):
@@ -781,9 +891,8 @@ class FunctionDiff(object):
         for k in filtered_attributes_b:
             filtered_attributes_b[k] = tuple((i+j) for i, j in zip(filtered_attributes_b[k], delta))
 
-        # get closest
-        closest_a = _get_closest_matches(filtered_attributes_a, filtered_attributes_b)
-        closest_b = _get_closest_matches(filtered_attributes_b, filtered_attributes_a)
+        # get closest - compute distance matrix ONCE for both directions (Issue #9 optimization)
+        closest_a, closest_b = _get_bidirectional_closest_matches(filtered_attributes_a, filtered_attributes_b)
 
         if tiebreak_with_block_similarity:
             # use block similarity to break ties in the first set
