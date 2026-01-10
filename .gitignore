@@ -50,3 +50,21 @@ htmlcov/
 
 # Debug
 .gdb_history
+
+# Test data
+test_silabs/
+
+# Benchmark logs and results
+benchmark_*.log
+benchmark_*.yml
+benchmark_results_*/
+BENCHMARK_*.md
+PERFORMANCE_OPTIMIZATION.md
+monitor_benchmark.sh
+benchmark_test.py
+
+# Investigation directories
+angr_investigation/
+
+# Autoblob
+autoblob/
