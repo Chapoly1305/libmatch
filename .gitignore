@@ -63,6 +63,3 @@ PERFORMANCE_OPTIMIZATION.md
 monitor_benchmark.sh
 benchmark_test.py
 
-# Investigation directories
-angr_investigation/
-
