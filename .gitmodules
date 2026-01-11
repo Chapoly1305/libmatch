@@ -1,3 +1,6 @@
 [submodule "autoblob"]
 	path = autoblob
 	url = git@github.com:Chapoly1305/autoblob.git
+[submodule "deps/cle"]
+	path = deps/cle
+	url = git@github.com:Chapoly1305/cle.git
