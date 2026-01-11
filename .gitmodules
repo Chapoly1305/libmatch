@@ -1,0 +1,3 @@
+[submodule "autoblob"]
+	path = autoblob
+	url = git@github.com:Chapoly1305/autoblob.git

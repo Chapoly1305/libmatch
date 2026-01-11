@@ -66,5 +66,3 @@ benchmark_test.py
 # Investigation directories
 angr_investigation/
 
-# Autoblob
-autoblob/
