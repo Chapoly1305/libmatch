@@ -5,7 +5,7 @@ setup(
     description='Library matcher for binaries given a database of library object files.',
     version='0.0.1.1',
     packages=find_packages(),
-    python_requires='>=3.10,<3.12',  # autoblob uses 'imp' module removed in Python 3.12
+    python_requires='>=3.10',
     install_requires=[
         'angr>=9.2.192',
         'networkx>=3.0',

@@ -3,7 +3,6 @@ import yaml
 import makeelf
 import argparse
 import sys
-import struct
 import time
 try:
     import psutil
@@ -19,6 +18,13 @@ import angr
 import os
 
 log = logging.getLogger('unblob')
+
+
+def parse_hex_int(value):
+    """Parse an integer that may be in hex (0x...) or decimal format."""
+    if value.startswith('0x') or value.startswith('0X'):
+        return int(value, 16)
+    return int(value)
 
 
 class OverallPerformanceTracker:
@@ -101,11 +107,13 @@ def parse_opts():
 
     parser.add_argument("-j", "--jobs", type=int, default=None, help="Number of parallel workers (default: auto-detect CPU count, max 16)")
 
-    input_opts = parser.add_argument_group("Input options")
-    input_opts.add_argument('--base-address', type=int, help="Manually specify the base address of the binary")
-    input_opts.add_argument('--entry-point', type=int, help="Manually specify the entry point of the binary")
-    input_opts.add_argument('--arch', help="Manually specify the architecture to use")
-    input_opts.add_argument('--cortex', help='Fast Cortex-M loading mode', action='store_true')
+    input_opts = parser.add_argument_group("Input options (override auto-detection)")
+    input_opts.add_argument('--arch', metavar='ARCH',
+                           help="Architecture (e.g., cortexm, arm, x86, amd64, mips, ppc, aarch64)")
+    input_opts.add_argument('--base', type=parse_hex_int, metavar='0xADDR',
+                           help="Base address (hex or decimal)")
+    input_opts.add_argument('--entry', type=parse_hex_int, metavar='0xADDR',
+                           help="Entry point (hex or decimal)")
 
     symbol_opts = parser.add_argument_group("Symbol Recovery Options")
     symbol_opts.add_argument("-S", "--disable-symbol-recovery", help="Enable symbol recovery", action='store_true')
@@ -132,36 +140,47 @@ def parse_opts():
     return opts
 
 
-def quick_cortex_parser(infile):
-    """
-    For a fully-formed Cortex-M code image:
-       The first word will be the little-endian initial stack pointer
-       The second word will be the little endian entry point (0'th interrupt or reset vector)
-    We guess the base address by rounding the entry point, Cortex-M's are pretty small :)
-
-    :param infile:
-    :return:
-    """
-    with open(infile, 'rb') as f:
-        initial_sp = struct.unpack('<I', f.read(4))[0]
-        entry = struct.unpack('<I', f.read(4))[0]
-        base = entry & 0xffff0000  # wow that's gross
-        return base, entry
-
-
 def load_it(opts):
+    """
+    Load binary with optional manual overrides for arch, base address, and entry point.
+    Falls back to autoblob for auto-detection if needed.
+    """
     try:
-        # Are we doing this manually?
-        if opts.base_address and opts.entry_point and opts.arch:
+        # If all parameters specified, use blob backend directly
+        if opts.arch and opts.base is not None and opts.entry is not None:
+            log.info(f"Loading with manual settings: arch={opts.arch}, base={opts.base:#x}, entry={opts.entry:#x}")
             p = angr.Project(opts.infile,
                              main_opts={'base_addr': opts.base,
                                         'arch': opts.arch,
                                         'backend': 'blob',
                                         'entry_point': opts.entry,
                                         'force_rebase': True})
-        else:
-            # Pray.
+            return p
+
+        # Try standard loading first (for ELF, PE, etc.)
+        try:
             p = angr.Project(opts.infile)
+            log.info("Loaded using standard backend")
+            return p
+        except Exception as e:
+            log.debug(f"Standard loading failed: {e}")
+
+        # Fall back to autoblob for auto-detection
+        log.info("Trying autoblob backend for auto-detection...")
+        main_opts = {'backend': 'autoblob'}
+
+        # Apply any manual overrides to autoblob
+        if opts.arch:
+            main_opts['arch'] = opts.arch
+            log.info(f"Using manual arch override: {opts.arch}")
+        if opts.base is not None:
+            main_opts['base_addr'] = opts.base
+            log.info(f"Using manual base address: {opts.base:#x}")
+        if opts.entry is not None:
+            main_opts['entry_point'] = opts.entry
+            log.info(f"Using manual entry point: {opts.entry:#x}")
+
+        p = angr.Project(opts.infile, main_opts=main_opts)
         return p
     except:
         log.exception("Error loading binary")
@@ -169,12 +188,12 @@ def load_it(opts):
 
 
 def make_yaml(project, symbol_map, opts):
-    # Do it
-    the_dict = {}
-    the_dict['architecture'] = opts.arch.qemu_name
-    the_dict['base_address'] = opts.base_address
-    the_dict['entry_point'] = opts.entry_point
-    the_dict['symbols'] = symbol_map
+    the_dict = {
+        'architecture': opts.detected_arch.qemu_name,
+        'base_address': opts.detected_base,
+        'entry_point': opts.detected_entry,
+        'symbols': symbol_map,
+    }
     with open(opts.outfile, 'w') as f:
         yaml.dump(the_dict, stream=f)
 
@@ -183,22 +202,16 @@ def do_normal(opts):
     # Initialize performance tracker
     perf = OverallPerformanceTracker()
 
-    # Dissect the binary.
+    # Load the binary (auto-detect or use manual overrides)
     perf.start_stage("Binary loading")
-    if not opts.base_address or not opts.entry_point or not opts.arch:
-        # We have some work to do....
-        if opts.cortex:
-            # Cortex mode
-            # Assume Arch=ARMEL
-            opts.arch = 'ARMEL'
-            opts.base_address, opts.entry_point = quick_cortex_parser(opts.infile)
     project = load_it(opts)
     if not project:
         log.critical("Load failed!")
         sys.exit(1)
-    opts.arch = project.arch
-    opts.base_address = project.loader.main_object.min_addr
-    opts.entry_point = project.entry
+    # Store detected values for later use
+    opts.detected_arch = project.arch
+    opts.detected_base = project.loader.main_object.min_addr
+    opts.detected_entry = project.entry
     perf.end_stage("Binary loading")
 
     log.info("################")

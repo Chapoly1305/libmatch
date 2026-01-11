@@ -85,6 +85,24 @@ Once that's done, grab your blob or ELF, and do:
 
 ...and go get a much smaller coffee. This will produce a YML file of symbols, immediately ready to be ingested by HALucinator or hal-fuzz.
 
+### Input Options
+
+For ELF files, architecture and addresses are auto-detected. For raw blobs, the tool uses `autoblob` to auto-detect Cortex-M binaries via the interrupt vector table.
+
+You can override auto-detection with these options:
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--arch ARCH` | Architecture (cortexm, arm, x86, amd64, mips, etc.) | `--arch cortexm` |
+| `--base 0xADDR` | Base address (hex or decimal) | `--base 0x8000000` |
+| `--entry 0xADDR` | Entry point (hex or decimal) | `--entry 0x8001000` |
+
+Example with manual overrides:
+```
+./utils/unblob -U --arch cortexm --base 0x8000000 -L ./objects/my_hal.lmdb -Y ./bins/my_firmware.bin ./bins/my_firmware.yml
+```
+
+### Scoring Mode
 
 Curious how well it's doing? Debugging problems? Got an ELF with symbols? Try this:
 
