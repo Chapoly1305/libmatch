@@ -158,8 +158,18 @@ def load_it(opts):
             return p
 
         # Try standard loading first (for ELF, PE, etc.)
+        # Apply base address override if specified
         try:
-            p = angr.Project(opts.infile)
+            main_opts = {}
+            if opts.base is not None:
+                main_opts['base_addr'] = opts.base
+                main_opts['force_rebase'] = True
+                log.info(f"Using manual base address: {opts.base:#x}")
+            p = angr.Project(opts.infile, main_opts=main_opts if main_opts else None)
+            # Override entry point after loading if specified
+            if opts.entry is not None:
+                p._entry = opts.entry
+                log.info(f"Using manual entry point: {opts.entry:#x}")
             log.info("Loaded using standard backend")
             return p
         except Exception as e:
