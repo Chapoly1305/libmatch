@@ -8,7 +8,6 @@ from collections import defaultdict
 from clint.textui.colored import red, green, yellow
 
 l = logging.getLogger("bdsig.utils")
-l.setLevel("DEBUG")
 
 PROJECT_KWARGS = {"load_options": {"rebase_granularity": 0x1000}}
 
@@ -111,14 +110,14 @@ def score_matches(target_lmd_name, matches, lmdb):
                             # we just have the name
                             sym_name = match
                             guesses += 1
-                            print(yellow("%#08x => %s (Guessed)" % (f_addr, sym_name)))
+                            l.debug("%#08x => %s (Guessed)" % (f_addr, sym_name))
                         else:
                             ignored += 1
             continue
         f_addr = sym.rebased_addr
         if f_addr in target_lmd.banned_addrs:
             ingored += 1
-            print("%#08x => Junk" % (f_addr))
+            l.debug("%#08x => Junk" % (f_addr))
         elif f_addr in matches:
             match_infos = matches[f_addr]
             if len(match_infos) == 1:
@@ -136,37 +135,37 @@ def score_matches(target_lmd_name, matches, lmdb):
                         sym_name = lmd.function_manager.get_by_addr(obj_func_addr).name
                         filename = lmd.filename
                     if sym_name in addrs_to_names[f_addr]:
-                        print(green("%#08x => %s:%s(%f) [Correct!] in %s" % (f_addr, lib, sym_name, similarity_score, filename)))
+                        l.debug("%#08x => %s:%s(%f) [Correct!] in %s" % (f_addr, lib, sym_name, similarity_score, filename))
                         precise_matches += 1
                     else:
-                        print(red("%#08x => %s:%s(%f) [WRONG, %s] in %s" % (f_addr, lib, sym_name, similarity_score, sym.name, lmd.filename)))
+                        l.debug("%#08x => %s:%s(%f) [WRONG, %s] in %s" % (f_addr, lib, sym_name, similarity_score, sym.name, lmd.filename))
                         incorrect_matches += 1
             elif len(match_infos) == 0:
                 missing += 1
-                print(red("%#08x => %s(UNMATCHED)" % (f_addr, sym.name)))
+                l.debug("%#08x => %s(UNMATCHED)" % (f_addr, sym.name))
             else:
                 imprecise_matches += 1
-                print(yellow("%#08x" % f_addr))
+                l.debug("%#08x" % f_addr)
                 for lib, lmd, match in match_infos:
                     obj_func_addr = match.function_b.addr
                     sym_name = lmd.function_manager.get_by_addr(obj_func_addr).name
                     if sym_name == sym.name:
-                        print(green("\t=> %s:%s(%f) in %s" % (lib, sym_name, match.similarity_score, lmd.filename)))
+                        l.debug("\t=> %s:%s(%f) in %s" % (lib, sym_name, match.similarity_score, lmd.filename))
                     else:
-                        print(yellow("\t=> %s:%s(%f) in %s" % (lib, sym_name, match.similarity_score, lmd.filename)))
+                        l.debug("\t=> %s:%s(%f) in %s" % (lib, sym_name, match.similarity_score, lmd.filename))
         else:
             missing += 1
-            print(red("%#08x => %s(UNMATCHED)" % (f_addr, sym.name)))
-    print("Matched symbols: %d" % precise_matches)
-    print("Missing symbols: %d" % missing)
-    print("Incorrect symbols: %d" % incorrect_matches)
-    print("Imprecise matches: %d" % imprecise_matches)
-    print("Guesses: %d" % guesses)
-    print("Ignored: %d" % ignored)
-    print("Total symbols: %d " % total_syms)
-    print("Hit rate: %f" % (precise_matches / total_syms))
-    print("Error rate: %f" % (incorrect_matches / total_syms))
-    print("Collision rate: %f" % (imprecise_matches / total_syms))
+            l.debug("%#08x => %s(UNMATCHED)" % (f_addr, sym.name))
+    l.info("Matched symbols: %d" % precise_matches)
+    l.info("Missing symbols: %d" % missing)
+    l.info("Incorrect symbols: %d" % incorrect_matches)
+    l.info("Imprecise matches: %d" % imprecise_matches)
+    l.info("Guesses: %d" % guesses)
+    l.info("Ignored: %d" % ignored)
+    l.info("Total symbols: %d " % total_syms)
+    l.info("Hit rate: %f" % (precise_matches / total_syms))
+    l.info("Error rate: %f" % (incorrect_matches / total_syms))
+    l.info("Collision rate: %f" % (imprecise_matches / total_syms))
 
 
 def print_matches(target, lmd_name, matches):

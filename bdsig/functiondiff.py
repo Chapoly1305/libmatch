@@ -18,7 +18,6 @@ except ImportError:
     HAVE_SCIPY = False
 
 l = logging.getLogger("bdsig.functiondiff")
-l.setLevel("INFO")
 
 if HAVE_RAPIDFUZZ:
     l.info("Using rapidfuzz for fast Levenshtein distance computation")
@@ -453,17 +452,29 @@ class FunctionDiff(object):
     """
     This class computes the a diff between two functions.
     """
-    def __init__(self, lmd_a, lmd_b, function_a, function_b):
+    def __init__(self, lmd_a, lmd_b, function_a, function_b, addr_bounds_a=None, addr_bounds_b=None):
         """
         :param lmd_a: The first LMD (owns function_a)
         :param lmd_b: The second LMD (owns function_b)
         :param function_a: The first NormalizedFunction object
         :param function_b: The second NormalizedFunction object
+        :param addr_bounds_a: Optional (min_addr, max_addr) tuple for lmd_a to avoid loader access
+        :param addr_bounds_b: Optional (min_addr, max_addr) tuple for lmd_b to avoid loader access
         """
         self.lmd_a = lmd_a
         self.lmd_b = lmd_b
         self.function_a = function_a
         self.function_b = function_b
+
+        # Cache address bounds to avoid touching loader objects (reduces COW in multiprocessing)
+        if addr_bounds_a is not None:
+            self._addr_bounds_a = addr_bounds_a
+        else:
+            self._addr_bounds_a = (lmd_a.loader.min_addr, lmd_a.loader.max_addr)
+        if addr_bounds_b is not None:
+            self._addr_bounds_b = addr_bounds_b
+        else:
+            self._addr_bounds_b = (lmd_b.loader.min_addr, lmd_b.loader.max_addr)
 
         # Use precomputed block attributes from LMD if available (Issue #1 optimization)
         # This avoids O(V+E) graph traversals per FunctionDiff
@@ -627,8 +638,11 @@ class FunctionDiff(object):
         # get all elements for computing similarity
         tags_a = [s.tag for s in block_a.statements]
         tags_b = [s.tag for s in block_b.statements]
-        consts_a = [c.value for c in block_a.all_constants if not self.lmd_a.loader.main_object.contains_addr(c.value)]
-        consts_b = [c.value for c in block_b.all_constants if not (self.lmd_b.loader.min_addr <= c.value < self.lmd_b.loader.max_addr)]
+        # Use cached address bounds to avoid touching loader (reduces COW in multiprocessing)
+        min_a, max_a = self._addr_bounds_a
+        min_b, max_b = self._addr_bounds_b
+        consts_a = [c.value for c in block_a.all_constants if not (min_a <= c.value < max_a)]
+        consts_b = [c.value for c in block_b.all_constants if not (min_b <= c.value < max_b)]
         all_registers_a = [s.offset for s in block_a.statements if hasattr(s, "offset")]
         all_registers_b = [s.offset for s in block_b.statements if hasattr(s, "offset")]
         jumpkind_a = block_a.jumpkind
@@ -728,8 +742,10 @@ class FunctionDiff(object):
                 continue
             # if both are in the binary we'll assume it's okay, although we should really match globals
             # TODO use global matches
-            if self.lmd_a.loader.main_object.contains_addr(c.value_a) and \
-                    self.lmd_b.loader.main_object.contains_addr(c.value_b):
+            # Use cached address bounds to avoid touching loader (reduces COW in multiprocessing)
+            min_a, max_a = self._addr_bounds_a
+            min_b, max_b = self._addr_bounds_b
+            if (min_a <= c.value_a < max_a) and (min_b <= c.value_b < max_b):
                 continue
             # if the difference is equal to the difference in block addr's or successor addr's we'll say it's also okay
             if c.value_b - c.value_a in acceptable_differences:

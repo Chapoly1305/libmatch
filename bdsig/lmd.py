@@ -15,7 +15,6 @@ from .iocg import InterObjectCallgraph
 
 
 l = logging.getLogger("bdsig.lmd")
-l.setLevel("DEBUG")
 
 
 class BlockCache:
@@ -330,7 +329,10 @@ class LibMatchDescriptor(object):
 
         # Normalize functions (using block cache)
         norm_func_start = time.time()
-        l.info("[LMD-PERF] Normalizing functions...")
+        total_funcs = len(self.cfg.kb.functions)
+        l.info(f"[LMD-PERF] Normalizing {total_funcs:,} functions...")
+        processed = 0
+        log_interval = max(1, total_funcs // 10)  # Log every 10%
         for faddr in self.cfg.kb.functions:
             f = self.cfg.kb.functions.function(faddr)
             self.normalized_functions[f.addr] = NormalizedFunction(proj, f, block_cache)
@@ -339,6 +341,10 @@ class LibMatchDescriptor(object):
                     self.normalized_blocks[(f.addr, b.addr)] = NormalizedBlock(proj, b, self.normalized_functions[f.addr], block_cache)
                 except (SimMemoryError, SimEngineError):
                     self.normalized_blocks[(f.addr, b.addr)] = None
+            processed += 1
+            if processed % log_interval == 0:
+                pct = 100 * processed / total_funcs
+                l.info(f"[LMD-PERF] Normalizing functions: {processed:,}/{total_funcs:,} ({pct:.0f}%)")
         cache_stats = block_cache.stats()
         _log_perf("Normalize functions", norm_func_start, f"| Funcs: {len(self.normalized_functions):,} | Blocks: {len(self.normalized_blocks):,} | Cache hits: {cache_stats}")
 

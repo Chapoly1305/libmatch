@@ -1,6 +1,5 @@
 import logging
 import os
-import resource
 import time
 import psutil
 from multiprocessing import Pool
@@ -10,7 +9,14 @@ from .functiondiff import FunctionDiff, FunctionDiffResult
 from collections import defaultdict
 
 l = logging.getLogger("bdsig.libmatch")
-l.setLevel("DEBUG")
+
+
+def _get_mem_gb():
+    """Get USS (Unique Set Size) memory in GB - most accurate for this process."""
+    try:
+        return psutil.Process().memory_full_info().uss / (1024**3)
+    except (AttributeError, psutil.AccessDenied):
+        return psutil.Process().memory_info().rss / (1024**3)
 
 
 class PerformanceTracker:
@@ -21,29 +27,20 @@ class PerformanceTracker:
         self.start_time = time.time()
         self.start_cpu = psutil.Process().cpu_times()
 
-    def _get_memory_info(self):
-        """Get current memory usage."""
-        process = psutil.Process()
-        mem_info = process.memory_info()
-        return {
-            'rss_mb': mem_info.rss / (1024 * 1024),
-            'rss_gb': mem_info.rss / (1024 * 1024 * 1024),
-            'vms_mb': mem_info.vms / (1024 * 1024),
-            'vms_gb': mem_info.vms / (1024 * 1024 * 1024),
-        }
-
-    def _get_cpu_percent(self):
-        """Get CPU usage percent."""
-        return psutil.Process().cpu_percent(interval=0.1)
+    def _get_mem_gb(self):
+        """Get USS (Unique Set Size) memory in GB - most accurate."""
+        try:
+            return psutil.Process().memory_full_info().uss / (1024**3)
+        except (AttributeError, psutil.AccessDenied):
+            return psutil.Process().memory_info().rss / (1024**3)
 
     def start_phase(self, phase_name):
         """Start tracking a phase."""
-        mem = self._get_memory_info()
+        mem_gb = self._get_mem_gb()
         cpu_times = psutil.Process().cpu_times()
         self.phases[phase_name] = {
             'start_time': time.time(),
-            'start_mem_rss_mb': mem['rss_mb'],
-            'start_mem_vms_mb': mem['vms_mb'],
+            'start_mem_gb': mem_gb,
             'start_cpu_user': cpu_times.user,
             'start_cpu_system': cpu_times.system,
             'end_time': None,
@@ -51,12 +48,12 @@ class PerformanceTracker:
             'work_items': 0,
             'matches': 0,
         }
-        l.info(f"[PERF] Phase '{phase_name}' started | Memory: {mem['rss_gb']:.2f} GB RSS, {mem['vms_gb']:.2f} GB VMS")
+        l.info(f"[PERF] Phase '{phase_name}' started | Mem: {mem_gb:.2f} GB")
 
     def end_phase(self, phase_name, work_items=0, matches=0):
         """End tracking a phase and log results."""
         if phase_name not in self.phases:
-            l.warning(f"[PERF] Phase '{phase_name}' was not started")
+            l.info(f"[PERF] Phase '{phase_name}' was not started")
             return
 
         phase = self.phases[phase_name]
@@ -65,12 +62,11 @@ class PerformanceTracker:
         phase['work_items'] = work_items
         phase['matches'] = matches
 
-        mem = self._get_memory_info()
+        mem_gb = self._get_mem_gb()
         cpu_times = psutil.Process().cpu_times()
 
-        phase['end_mem_rss_mb'] = mem['rss_mb']
-        phase['end_mem_vms_mb'] = mem['vms_mb']
-        phase['mem_delta_mb'] = mem['rss_mb'] - phase['start_mem_rss_mb']
+        phase['end_mem_gb'] = mem_gb
+        phase['mem_delta_mb'] = (mem_gb - phase['start_mem_gb']) * 1024
         phase['cpu_user_delta'] = cpu_times.user - phase['start_cpu_user']
         phase['cpu_system_delta'] = cpu_times.system - phase['start_cpu_system']
         phase['cpu_total_delta'] = phase['cpu_user_delta'] + phase['cpu_system_delta']
@@ -80,7 +76,7 @@ class PerformanceTracker:
 
         l.info(f"[PERF] Phase '{phase_name}' completed:")
         l.info(f"[PERF]   Duration: {phase['duration']:.2f}s")
-        l.info(f"[PERF]   Memory: {mem['rss_gb']:.2f} GB RSS (delta: {phase['mem_delta_mb']:+.0f} MB)")
+        l.info(f"[PERF]   Memory: {mem_gb:.2f} GB (delta: {phase['mem_delta_mb']:+.0f} MB)")
         l.info(f"[PERF]   CPU time: {phase['cpu_total_delta']:.2f}s (user: {phase['cpu_user_delta']:.2f}s, sys: {phase['cpu_system_delta']:.2f}s)")
         if work_items > 0:
             l.info(f"[PERF]   Work items: {work_items:,} | Throughput: {throughput:,.0f}/s")
@@ -98,27 +94,26 @@ class PerformanceTracker:
         eta = (total - processed) / rate if rate > 0 else 0
         pct = 100.0 * processed / total if total > 0 else 0
 
-        mem = self._get_memory_info()
-        l.info(f"[PERF] {phase_name}: {processed:,}/{total:,} ({pct:.1f}%) | {rate:,.0f}/s | ETA: {eta:.0f}s | Matches: {matches:,} | Mem: {mem['rss_gb']:.2f} GB")
+        mem_gb = self._get_mem_gb()
+        l.info(f"[PERF] {phase_name}: {processed:,}/{total:,} ({pct:.1f}%) | {rate:,.0f}/s | ETA: {eta:.0f}s | Matches: {matches:,} | Mem: {mem_gb:.2f} GB")
 
-    def get_summary(self):
-        """Generate a performance summary."""
+    def log_summary(self):
+        """Log performance summary using the logger."""
         total_duration = time.time() - self.start_time
         cpu_times = psutil.Process().cpu_times()
         total_cpu = (cpu_times.user - self.start_cpu.user) + (cpu_times.system - self.start_cpu.system)
-        mem = self._get_memory_info()
+        mem_gb = self._get_mem_gb()
 
-        summary = []
-        summary.append("=" * 70)
-        summary.append("LIBMATCH PERFORMANCE SUMMARY")
-        summary.append("=" * 70)
-        summary.append(f"Total wall time: {total_duration:.2f}s ({total_duration/60:.2f} min)")
-        summary.append(f"Total CPU time: {total_cpu:.2f}s")
-        summary.append(f"CPU efficiency: {100*total_cpu/total_duration:.1f}%" if total_duration > 0 else "N/A")
-        summary.append(f"Peak memory: {mem['rss_gb']:.2f} GB RSS")
-        summary.append("-" * 70)
-        summary.append(f"{'Phase':<25} {'Duration':>10} {'Work Items':>12} {'Rate':>10} {'Matches':>10}")
-        summary.append("-" * 70)
+        l.info("=" * 70)
+        l.info("LIBMATCH PERFORMANCE SUMMARY")
+        l.info("=" * 70)
+        l.info(f"Total wall time: {total_duration:.2f}s ({total_duration/60:.2f} min)")
+        l.info(f"Total CPU time: {total_cpu:.2f}s")
+        l.info(f"CPU efficiency: {100*total_cpu/total_duration:.1f}%" if total_duration > 0 else "N/A")
+        l.info(f"Final memory: {mem_gb:.2f} GB")
+        l.info("-" * 70)
+        l.info(f"{'Phase':<25} {'Duration':>10} {'Work Items':>12} {'Rate':>10} {'Matches':>10}")
+        l.info("-" * 70)
 
         for phase_name, phase in self.phases.items():
             if phase['duration'] is not None:
@@ -127,10 +122,9 @@ class PerformanceTracker:
                 rate = phase['work_items'] / phase['duration'] if phase['duration'] > 0 and phase['work_items'] > 0 else 0
                 rate_str = f"{rate:,.0f}/s" if rate > 0 else "-"
                 matches_str = f"{phase['matches']:,}" if phase['matches'] > 0 else "-"
-                summary.append(f"{phase_name:<25} {duration_str:>10} {work_str:>12} {rate_str:>10} {matches_str:>10}")
+                l.info(f"{phase_name:<25} {duration_str:>10} {work_str:>12} {rate_str:>10} {matches_str:>10}")
 
-        summary.append("=" * 70)
-        return "\n".join(summary)
+        l.info("=" * 70)
 
 
 # Global performance tracker
@@ -145,41 +139,26 @@ def _get_perf_tracker():
     return _perf_tracker
 
 
-def _log_memory_usage(label=""):
-    """Log current memory usage in GB."""
-    try:
-        process = psutil.Process()
-        mem_info = process.memory_info()
-        mem_gb = mem_info.rss / (1024 * 1024 * 1024)
-        mem_mb = mem_info.rss / (1024 * 1024)
-        l.info(f"Memory [{label}]: {mem_gb:.2f} GB ({mem_mb:.0f} MB)")
-    except:
-        # Fallback to resource module
-        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB
-        mem_gb = mem_mb / 1024
-        l.info(f"Memory [{label}]: {mem_gb:.2f} GB ({mem_mb:.0f} MB)")
-
-# Configuration for parallelization
-USE_PARALLEL = os.environ.get('LIBMATCH_PARALLEL', '1') == '1'
-# Auto-detect worker count based on CPU cores (default: min of 16 or CPU count)
-_default_workers = min(16, os.cpu_count() or 8)
-NUM_WORKERS = int(os.environ.get('LIBMATCH_WORKERS', str(_default_workers)))
 
 # Global references for worker processes (set during worker init)
 # This avoids pickling large LMD objects for every work item
 _binary_lmd = None
 _lib_lmds = {}
+_addr_bounds = {}  # Cache address bounds to avoid touching loader objects
 
 
-def _init_worker(binary_lmd, lib_lmds_dict):
+def _init_worker(binary_lmd, lib_lmds_dict, addr_bounds):
     """
     Initialize worker process with shared data.
     Called ONCE per worker when Pool is created (not per work item).
     Uses fork() Copy-on-Write to share memory efficiently.
+
+    addr_bounds: dict mapping lmd_id -> (min_addr, max_addr) to avoid loader access
     """
-    global _binary_lmd, _lib_lmds
+    global _binary_lmd, _lib_lmds, _addr_bounds
     _binary_lmd = binary_lmd
     _lib_lmds = lib_lmds_dict
+    _addr_bounds = addr_bounds
 
 
 def _compute_function_diff_worker(args):
@@ -190,14 +169,19 @@ def _compute_function_diff_worker(args):
     :param args: Tuple of (lmd_id, binary_faddr, lib_faddr) - just 3 integers!
     :returns: Tuple of (binary_faddr, lib_faddr, fd, lmd_id) if probably_identical, else None
     """
-    global _binary_lmd, _lib_lmds
+    global _binary_lmd, _lib_lmds, _addr_bounds
     lmd_id, binary_faddr, lib_faddr = args
 
     try:
         lib_lmd = _lib_lmds[lmd_id]
         bin_func = _binary_lmd.normalized_functions[binary_faddr]
         lib_func = lib_lmd.normalized_functions[lib_faddr]
-        fd = FunctionDiff(_binary_lmd, lib_lmd, bin_func, lib_func)
+        # Pass pre-computed address bounds to avoid touching loader objects (reduces COW)
+        fd = FunctionDiff(
+            _binary_lmd, lib_lmd, bin_func, lib_func,
+            addr_bounds_a=_addr_bounds.get('binary'),
+            addr_bounds_b=_addr_bounds.get(lmd_id)
+        )
         if fd.probably_identical:
             # Return lightweight FunctionDiffResult (~2-3KB) instead of FunctionDiff (~14MB)
             # This prevents memory leak in multiprocessing by breaking references to NormalizedFunction
@@ -209,16 +193,24 @@ def _compute_function_diff_worker(args):
 
 
 class LibMatch(object):
-    def __init__(self, binary_lmd, lmdb):
+    def __init__(self, binary_lmd, lmdb, jobs=None):
         """
         :param binary_lmd: The LibMatchDescriptor of the target binary
-        :param lib_lmds: An iterable of LibMatchDescriptors corresponding to libraries
+        :param lmdb: LibMatchDatabase containing library LMDs
+        :param jobs: Number of parallel workers (None for auto-detect, 1 for sequential)
         """
         self.binary_lmd = binary_lmd
         self.lmdb = lmdb
         self.ambiguous_funcs = []
         self._first_order_matches = defaultdict()
         self._second_order_matches = defaultdict()
+
+        # Set up parallelization
+        if jobs is None:
+            # Auto-detect: use min(16, CPU count)
+            self._jobs = min(16, os.cpu_count() or 8)
+        else:
+            self._jobs = jobs
 
         self._compute()
 
@@ -321,13 +313,17 @@ class LibMatch(object):
             return
 
         # Calculate optimal chunk size
-        # Smaller chunks for better load balancing (was NUM_WORKERS * 4)
+        # Smaller chunks for better load balancing
         # More chunks = more even distribution when function complexity varies
         # With 14M items and 16 workers: ~8,750 chunks of ~1,600 items each
-        chunk_size = max(100, min(2000, len(work_items) // (NUM_WORKERS * 100)))
+        chunk_size = max(100, min(2000, len(work_items) // (self._jobs * 100)))
 
-        l.info(f"Phase 2: Processing {len(work_items)} function pairs with {NUM_WORKERS} workers (chunk_size={chunk_size})")
-        _log_memory_usage("Before Pool creation")
+        l.info(f"Phase 2: Processing {len(work_items)} function pairs with {self._jobs} workers (chunk_size={chunk_size})")
+
+        # Pre-compute address bounds to avoid workers touching loader objects (reduces COW memory)
+        addr_bounds = {'binary': (self.binary_lmd.loader.min_addr, self.binary_lmd.loader.max_addr)}
+        for lmd_id, lmd in lib_lmds_dict.items():
+            addr_bounds[lmd_id] = (lmd.loader.min_addr, lmd.loader.max_addr)
 
         # Process in parallel with worker initialization
         # LMDs are passed ONCE per worker during Pool creation (via fork() COW)
@@ -337,11 +333,11 @@ class LibMatch(object):
         log_interval = max(1000, len(work_items) // 20)  # Log every 5% or 1000 items
 
         with Pool(
-            processes=NUM_WORKERS,
+            processes=self._jobs,
             initializer=_init_worker,
-            initargs=(self.binary_lmd, lib_lmds_dict)
+            initargs=(self.binary_lmd, lib_lmds_dict, addr_bounds),
+            maxtasksperchild=100  # Recycle workers after 100 chunks (~200K items) to release memory
         ) as pool:
-            _log_memory_usage("After Pool creation")
             for result in pool.imap_unordered(
                 _compute_function_diff_worker,
                 work_items,
@@ -355,10 +351,8 @@ class LibMatch(object):
                     elapsed = time.time() - start_time
                     rate = processed / elapsed if elapsed > 0 else 0
                     eta = (len(work_items) - processed) / rate if rate > 0 else 0
-                    l.info(f"Phase 2: {processed}/{len(work_items)} ({100*processed/len(work_items):.1f}%) - {rate:.0f}/s - ETA {eta:.0f}s - {len(results)} matches")
-                    _log_memory_usage(f"Progress {processed}")
-
-        _log_memory_usage("After Pool completed")
+                    mem_gb = _get_mem_gb()
+                    l.info(f"Phase 2: {processed}/{len(work_items)} ({100*processed/len(work_items):.1f}%) - {rate:.0f}/s - ETA {eta:.0f}s - {len(results)} matches - Mem: {mem_gb:.2f} GB")
 
         # Aggregate results into self._second_order_matches
         # Use lmd_id to look up actual lmd object from lib_lmds_dict
@@ -443,14 +437,14 @@ class LibMatch(object):
         # Maybe we should check everything, even if it has more than one match.
         # No match is better than one wrong one!
         if f_addr in self.recursion_set:
-            l.warning("Oof, recursion to %#08x!" % f_addr)
+            l.debug("Oof, recursion to %#08x!" % f_addr)
             return
         self.recursion_set.add(f_addr)
         if len(matches) == 1:
             # Perfect match! cannot refine
             self.recursion_set.discard(f_addr)
             return
-        l.info("Analyzing function %#08x" % f_addr)
+        l.debug("Analyzing function %#08x" % f_addr)
         # Get the target for each candidate match
         target_func = list(matches)[0][2].function_a
         target_callees = []
@@ -464,7 +458,7 @@ class LibMatch(object):
                     callee_name = "Ignored"
                     target_callees.append({(callee, callee_name,)})
                 elif callee not in self._candidate_matches or len(self._candidate_matches[callee]) == 0:
-                    l.error("Cannot disambiguate function at %#08x, unmatched call to %#08x" % (f_addr, callee))
+                    l.debug("Cannot disambiguate function at %#08x, unmatched call to %#08x" % (f_addr, callee))
                     self.ambiguous_funcs.append(f_addr)
                     self.recursion_set.discard(f_addr)
                     return  # We're fucked
@@ -472,14 +466,14 @@ class LibMatch(object):
                     callee_matches = self._candidate_matches[callee]
                     if len(callee_matches) > 1:
                         if callee == f_addr:
-                            l.warning("Recursion is bad!")
+                            l.debug("Recursion is bad!")
                             continue
-                        l.error("Recursively resolving %#08x" % callee)
+                        l.debug("Recursively resolving %#08x" % callee)
                         self._narrow_third_order(callee, callee_matches)
                         self.squish(callee)
 
                         if exact_narrowing and len(self._candidate_matches[callee]) > 1:
-                            l.error("Failed to narrow down call to %#08x" % callee)
+                            l.debug("Failed to narrow down call to %#08x" % callee)
                             self.ambiguous_funcs.append(f_addr)
                             self.recursion_set.discard(f_addr)
                             return
@@ -493,7 +487,7 @@ class LibMatch(object):
                         possible_callees.add((callee, callee_name,))
                     target_callees.append(possible_callees)
         if not target_callees:
-            l.error("No calls in function %#08x, cannot disambiguate" % f_addr)
+            l.debug("No calls in function %#08x, cannot disambiguate" % f_addr)
             self.ambiguous_funcs.append(f_addr)
             return
         # For each possible match
@@ -518,7 +512,7 @@ class LibMatch(object):
                     targ_callee_addr = list(possible_targ_callees)[0][0]
                     lib_callee_name = match_lmd.symbol_for_addr(lib_callee).name
                 except:
-                    l.error("Hmm, something is wrong %#08x %#08x %s" % (f_addr, lib_callee, match_lmd.filename))
+                    l.debug("Hmm, something is wrong %#08x %#08x %s" % (f_addr, lib_callee, match_lmd.filename))
                     return
                 for targ_callee in possible_targ_callees:
                     targ_callee_addr, targ_callee_name = targ_callee
@@ -533,7 +527,7 @@ class LibMatch(object):
                     break
             else:
                 self._candidate_matches[f_addr].append((lib_name, match_lmd, match_diff))
-                l.error("Resolved call to %#08x to %s via callgraph" % (f_addr, match_name))
+                l.debug("Resolved call to %#08x to %s via callgraph" % (f_addr, match_name))
         self.recursion_set.discard(f_addr)
 
     def _narrow_fourth_order(self, f_addr, matches):
@@ -549,7 +543,7 @@ class LibMatch(object):
         :return:
         """
         if f_addr in self.recursion_set:
-            l.warning("Oof, recursion to %#08x!" % f_addr)
+            l.debug("Oof, recursion to %#08x!" % f_addr)
             return
         self.recursion_set.add(f_addr)
         if len(matches) != 1:
@@ -576,15 +570,15 @@ class LibMatch(object):
                     # library and make that the name to match.
                     guessed_sym = m_lmd.symbol_for_addr(lib_callee)
                     if guessed_sym is None:
-                        l.info("No findable name for call to %#08x from %#08x(%s)"% (targ_callee, target_func.addr, lib_func.name))
+                        l.debug("No findable name for call to %#08x from %#08x(%s)"% (targ_callee, target_func.addr, lib_func.name))
                     else:
                         guessed_name = guessed_sym.name
-                        l.info("Guessing name of %#08x is %s due to call from %#08x(%s)" % (targ_callee, guessed_name, target_func.addr, lib_func.name))
+                        l.debug("Guessing name of %#08x is %s due to call from %#08x(%s)" % (targ_callee, guessed_name, target_func.addr, lib_func.name))
                         self._candidate_matches[targ_callee] = [(m_lib, m_lmd, guessed_name)]
                 elif len(self._candidate_matches[targ_callee]) == 1:
                     guessed_sym = m_lmd.symbol_for_addr(lib_callee)
                     if guessed_sym is None:
-                        l.info("No findable name for call to %#08x from %#08x(%s)" % (
+                        l.debug("No findable name for call to %#08x from %#08x(%s)" % (
                         targ_callee, target_func.addr, lib_func.name))
                     else:
                         guessed_name = guessed_sym.name
@@ -595,7 +589,7 @@ class LibMatch(object):
                         else:
                             if fd.function_b.name == guessed_name:
                                 continue
-                        l.info("Guessing name of %#08x is %s due to call from %#08x(%s)" % (
+                        l.debug("Guessing name of %#08x is %s due to call from %#08x(%s)" % (
                         targ_callee, guessed_name, target_func.addr, lib_func.name))
                         self._candidate_matches[targ_callee] = [(m_lib, m_lmd, guessed_name)]
                     # Nothing to do
@@ -605,14 +599,14 @@ class LibMatch(object):
                     # name based on the lib's symbols
                     guessed_sym = m_lmd.symbol_for_addr(lib_callee)
                     if not guessed_sym:
-                        l.warning("Couldn't figure out what %#08x is, called by func %#08x" % (lib_callee, lib_func.addr))
+                        l.debug("Couldn't figure out what %#08x is, called by func %#08x" % (lib_callee, lib_func.addr))
                         continue
                     guessed_name = guessed_sym.name
                     new_matches = []
                     for match in self._candidate_matches[targ_callee]:
                         c_lib, c_lmd, c_fd = match
                         if c_fd.function_b.name == guessed_name:
-                            l.info("Resolving %#08x to %s via call from %#08x(%s)" % (targ_callee, guessed_name, target_func.addr, lib_func.name))
+                            l.debug("Resolving %#08x to %s via call from %#08x(%s)" % (targ_callee, guessed_name, target_func.addr, lib_func.name))
                             new_matches.append((c_lib, c_lmd, c_fd,))
                     self._candidate_matches[targ_callee] = new_matches
                     if not new_matches:
@@ -620,17 +614,17 @@ class LibMatch(object):
                         # Try something new instead
                         guessed_sym = m_lmd.symbol_for_addr(lib_callee)
                         if guessed_sym is None:
-                            l.info("No findable name for call to %#08x from %#08x(%s)" % (
+                            l.debug("No findable name for call to %#08x from %#08x(%s)" % (
                                 targ_callee, target_func.addr, lib_func.name))
                         else:
                             guessed_name = guessed_sym.name
-                            l.info("Guessing name of %#08x is %s due to call from %#08x(%s)" % (
+                            l.debug("Guessing name of %#08x is %s due to call from %#08x(%s)" % (
                                     targ_callee, guessed_name, target_func.addr, lib_func.name))
                             self._candidate_matches[targ_callee] = [(m_lib, m_lmd, guessed_name)]
                     self.squish(targ_callee)
                     if len(self._candidate_matches[targ_callee]) == 1:
                         # Recurse, see if that helps any.
-                        l.info("Recursively resolving %#08x" % targ_callee)
+                        l.debug("Recursively resolving %#08x" % targ_callee)
                         self._narrow_fourth_order(targ_callee, self._candidate_matches[targ_callee])
         self.recursion_set.discard(f_addr)
 
@@ -658,7 +652,7 @@ class LibMatch(object):
                 for match in matches:
                     m_lib, m_lmd, m_fd = match
                     if m_fd.function_b.name in good_hits:
-                        l.info("Removing %s from consideration for %#08x" % (m_fd.function_b.name, f_addr))
+                        l.debug("Removing %s from consideration for %#08x" % (m_fd.function_b.name, f_addr))
                         fixed_matches.remove(match)
                 self._candidate_matches[f_addr] = fixed_matches
 
@@ -668,7 +662,6 @@ class LibMatch(object):
         """
         # Initialize performance tracker
         perf = _get_perf_tracker()
-        _log_memory_usage("Start")
 
         # Phase 1: first order matches (matches depending only on the attr tuples)
         perf.start_phase("Phase 1: Coarse matching")
@@ -686,14 +679,14 @@ class LibMatch(object):
         )
         perf.end_phase("Phase 1: Coarse matching", work_items=phase1_work, matches=phase1_matches)
 
-        # Phase 2: Use parallel or sequential version based on configuration
+        # Phase 2: Use parallel or sequential version based on jobs setting
         perf.start_phase("Phase 2: FunctionDiff")
-        if USE_PARALLEL:
-            l.info(f"Phase 2: FunctionDiff (PARALLEL with {NUM_WORKERS} workers)")
+        if self._jobs > 1:
+            l.info(f"Phase 2: FunctionDiff (PARALLEL with {self._jobs} workers, -j{self._jobs})")
             for lib in self.lmdb.lib_lmds:
                 self._compute_second_order_matches_parallel(lib)
         else:
-            l.info("Phase 2: FunctionDiff (SEQUENTIAL)")
+            l.info("Phase 2: FunctionDiff (SEQUENTIAL, -j1)")
             for lib in self.lmdb.lib_lmds:
                 self._compute_second_order_matches(lib)
 
@@ -724,4 +717,4 @@ class LibMatch(object):
         perf.end_phase("Phase 5: Deduplication")
 
         # Log performance summary
-        l.info("\n" + perf.get_summary())
+        perf.log_summary()

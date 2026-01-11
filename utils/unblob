@@ -30,11 +30,18 @@ class OverallPerformanceTracker:
         if HAS_PSUTIL:
             self.start_cpu = psutil.Process().cpu_times()
 
+    def _get_mem_gb(self):
+        """Get USS (Unique Set Size) memory in GB - most accurate for this process."""
+        if not HAS_PSUTIL:
+            return 0
+        try:
+            return psutil.Process().memory_full_info().uss / (1024**3)
+        except (AttributeError, psutil.AccessDenied):
+            return psutil.Process().memory_info().rss / (1024**3)
+
     def start_stage(self, name):
         """Start timing a stage."""
-        mem_gb = 0
-        if HAS_PSUTIL:
-            mem_gb = psutil.Process().memory_info().rss / (1024**3)
+        mem_gb = self._get_mem_gb()
         self.stages[name] = {
             'start': time.time(),
             'end': None,
@@ -50,9 +57,7 @@ class OverallPerformanceTracker:
         stage = self.stages[name]
         stage['end'] = time.time()
         stage['duration'] = stage['end'] - stage['start']
-        mem_gb = 0
-        if HAS_PSUTIL:
-            mem_gb = psutil.Process().memory_info().rss / (1024**3)
+        mem_gb = self._get_mem_gb()
         stage['end_mem_gb'] = mem_gb
         log.info(f"[STAGE] {name} completed: {stage['duration']:.2f}s | Mem: {mem_gb:.2f} GB {extra}")
 
@@ -69,7 +74,7 @@ class OverallPerformanceTracker:
             total_cpu = (cpu_times.user - self.start_cpu.user) + (cpu_times.system - self.start_cpu.system)
             log.info(f"Total CPU time: {total_cpu:.2f}s")
             log.info(f"CPU efficiency: {100*total_cpu/total_time:.1f}%")
-            mem_gb = psutil.Process().memory_info().rss / (1024**3)
+            mem_gb = self._get_mem_gb()
             log.info(f"Final memory: {mem_gb:.2f} GB")
 
         log.info("-" * 70)
@@ -93,6 +98,8 @@ def parse_opts():
     modes.add_argument("-U", dest='mode_normal', action='store_true', help='Unblobulate!')
     modes.add_argument("-X", dest='mode_extract', action='store_true', help='Extract')
     modes.add_argument("-B", dest='mode_build', action='store_true', help="Build library signatures (provide input directory and output LMDB filename)")
+
+    parser.add_argument("-j", "--jobs", type=int, default=None, help="Number of parallel workers (default: auto-detect CPU count, max 16)")
 
     input_opts = parser.add_argument_group("Input options")
     input_opts.add_argument('--base-address', type=int, help="Manually specify the base address of the binary")
@@ -225,7 +232,7 @@ def do_normal(opts):
         # Symbol recovery
         perf.start_stage("Symbol recovery")
         log.info("Beginning symbol recovery")
-        symbol_map = lmdb.match(lmd, score=opts.scoring)
+        symbol_map = lmdb.match(lmd, score=opts.scoring, jobs=opts.jobs)
         perf.end_stage("Symbol recovery", f"| Matched: {len(symbol_map):,}")
 
     # Create the output
@@ -243,24 +250,31 @@ def do_normal(opts):
 def do_build(opts):
     libs_dir = opts.infile
     if not os.path.isdir(libs_dir):
-        print("%s is not a directory" % libs_dir)
+        log.error("%s is not a directory" % libs_dir)
         sys.exit(1)
-    LibMatchDatabase.build(libs_dir)
+    output_path = opts.outfile
+    jobs = opts.jobs if opts.jobs is not None else min(16, os.cpu_count() or 8)
+    log.info(f"Building LMDB with -j{jobs}")
+    LibMatchDatabase.build(libs_dir, output_path=output_path, jobs=jobs)
 
 def stfu(thing):
     l = logging.getLogger(thing)
     l.setLevel(logging.CRITICAL)
 
 if __name__ == '__main__':
-    logging.basicConfig()
-    log.setLevel("INFO")
+    opts = parse_opts()
+
+    # Set log level based on --debug flag
+    log_level = logging.DEBUG if opts.debug else logging.INFO
+    logging.basicConfig(level=log_level)
+    log.setLevel(log_level)
+    logging.getLogger("bdsig").setLevel(log_level)
+
     stfu('cle.elf')
     stfu('cle.loader')
     stfu('angr.analyses.cfg.cfg_fast')
     stfu('angr.state_plugins.symbolic_memory')
     stfu('angr.engines.successors')
-
-    opts = parse_opts()
     if opts.mode_normal:
         do_normal(opts)
     elif opts.mode_build:

@@ -4,7 +4,6 @@ import pickle
 
 
 l = logging.getLogger("bdsig.iocg")
-l.setLevel("DEBUG")
 
 class NameCollisionException(Exception):
     pass

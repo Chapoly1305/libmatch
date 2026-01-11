@@ -3,7 +3,12 @@ import logging
 import pickle
 import os
 import time
+import tempfile
+import shutil
+import subprocess
 import angr
+import gc
+from multiprocessing import Pool
 try:
     import psutil
     HAS_PSUTIL = True
@@ -16,14 +21,38 @@ from .libmatch import LibMatch
 from .utils import score_matches
 
 l = logging.getLogger("bdsig.lmdb")
-l.setLevel("DEBUG")
+
+
+def _build_lmd_worker(filepath):
+    """
+    Worker function to build a single LMD from a file.
+    Each worker creates its own angr.Project and LMD.
+
+    :param filepath: Path to the .o/.obj file
+    :returns: Tuple of (filepath, LMD) if successful, (filepath, None) if failed
+    """
+    try:
+        lmd = LibMatchDescriptor.make_signature(filepath, **PROJECT_KWARGS)
+        lmd.release_cfg()  # Release CFG before returning - saves memory and pickle size
+        gc.collect()
+        return (filepath, lmd)
+    except angr.errors.AngrCFGError:
+        l.warning(f"No executable data for {filepath}, skipping")
+        return (filepath, None)
+    except Exception as e:
+        l.exception(f"Could not make signature for {filepath}")
+        return (filepath, None)
 
 
 def _log_perf(label, start_time=None, extra=""):
     """Log performance info for LMDB operations."""
     if HAS_PSUTIL:
-        mem = psutil.Process().memory_info()
-        mem_gb = mem.rss / (1024 * 1024 * 1024)
+        try:
+            # USS = Unique Set Size: memory private to this process (most accurate)
+            mem_gb = psutil.Process().memory_full_info().uss / (1024 * 1024 * 1024)
+        except (AttributeError, psutil.AccessDenied):
+            # Fallback to RSS if USS unavailable
+            mem_gb = psutil.Process().memory_info().rss / (1024 * 1024 * 1024)
         if start_time:
             elapsed = time.time() - start_time
             l.info(f"[LMDB-PERF] {label}: {elapsed:.2f}s | Mem: {mem_gb:.2f} GB {extra}")
@@ -92,11 +121,13 @@ class LibMatchDatabase(object):
         l.warning("Matched %d symbols" % len(list(final_matches.keys())))
         return final_matches
 
-    def match(self, lmd_path, score=False):
+    def match(self, lmd_path, score=False, jobs=None):
         """
         Scan the database and try to match all libraries with the target.
 
         :param lib: Either a string (program path) or a LibMatchDescriptor
+        :param score: Enable scoring mode
+        :param jobs: Number of parallel workers (None for auto-detect, 1 for sequential)
         :return: A dictionary of addresses in the program to possible symbols.
         """
         match_start = time.time()
@@ -112,7 +143,7 @@ class LibMatchDatabase(object):
         candidates = []
         try:
             libmatch_start = time.time()
-            self.lm = LibMatch(lmd, self)
+            self.lm = LibMatch(lmd, self, jobs=jobs)
             _log_perf("LibMatch computation", libmatch_start)
             candidates = self.lm._candidate_matches
             plain_candidates = self.lm._plain_matches
@@ -125,10 +156,9 @@ class LibMatchDatabase(object):
         candidates = self._smoosh(candidates)
         plain_candidates = self._smoosh(plain_candidates)
         if score:
-            print("############### UNREFINED MATCHES ###############")
+            l.info("############### UNREFINED MATCHES ###############")
             score_matches(lmd_path, plain_candidates, self)
-            print()  # Empty line for readability
-            print("############### FINAL MATCHES ###############")
+            l.info("############### FINAL MATCHES ###############")
             score_matches(lmd_path, candidates, self)
 
         out = self._postprocess_matches(lmd, candidates)
@@ -138,45 +168,200 @@ class LibMatchDatabase(object):
 
     # Creation and Serialization
     @staticmethod
-    def _build_lib(lib_dir):
+    def _extract_archive(archive_path, extract_dir):
+        """
+        Extract object files from a .a archive file.
+
+        :param archive_path: Path to the .a archive file
+        :param extract_dir: Directory to extract files into
+        :return: List of extracted .o file paths
+        """
+        extracted_files = []
+        archive_name = os.path.basename(archive_path)
+
+        # Convert to absolute path for use with cwd in subprocess
+        archive_path_abs = os.path.abspath(archive_path)
+
+        # Create a subdirectory for this archive to avoid name collisions
+        archive_extract_dir = os.path.join(extract_dir, archive_name.replace('.a', ''))
+        os.makedirs(archive_extract_dir, exist_ok=True)
+
+        try:
+            # Use 'ar' to list contents first
+            result = subprocess.run(
+                ['ar', '-t', archive_path_abs],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+
+            if result.returncode != 0:
+                l.warning(f"Failed to list archive {archive_path}: {result.stderr}")
+                return []
+
+            # Extract all files (larger timeout for big archives like libCHIP.a)
+            result = subprocess.run(
+                ['ar', '-x', archive_path_abs],
+                capture_output=True,
+                text=True,
+                cwd=archive_extract_dir,
+                timeout=300
+            )
+
+            if result.returncode != 0:
+                l.warning(f"Failed to extract archive {archive_path}: {result.stderr}")
+                return []
+
+            # Find all extracted .o files
+            for fname in os.listdir(archive_extract_dir):
+                if fname.endswith('.o') or fname.endswith('.obj'):
+                    extracted_files.append(os.path.join(archive_extract_dir, fname))
+
+            l.info(f"Extracted {len(extracted_files)} object files from {archive_name}")
+
+        except subprocess.TimeoutExpired:
+            l.warning(f"Timeout extracting archive {archive_path}")
+        except FileNotFoundError:
+            l.error("'ar' command not found. Please install binutils.")
+        except Exception as e:
+            l.exception(f"Error extracting archive {archive_path}: {e}")
+
+        return extracted_files
+
+    @staticmethod
+    def _process_object_file(fullfname, lmds):
+        """
+        Process a single object file and add its signature to lmds set.
+
+        :param fullfname: Full path to the object file
+        :param lmds: Set to add the LMD to
+        :return: True if successful, False otherwise
+        """
+        try:
+            lmd = LibMatchDescriptor.make_signature(fullfname, **PROJECT_KWARGS)
+            lmd.release_cfg()  # Release CFG immediately - saves 5-7GB per file
+            lmds.add(lmd)
+            gc.collect()  # Force garbage collection before next file
+            _log_perf(f"Processed {os.path.basename(fullfname)}")
+            return True
+        except angr.errors.AngrCFGError:
+            l.warning("No executable data for %s, skipping" % fullfname)
+        except Exception as e:
+            l.exception("Could not make signature for " + fullfname)
+        return False
+
+    @staticmethod
+    def _build_lib(lib_dir, jobs=1):
+        """
+        Build signatures for all object files in a library directory.
+        Supports both .o/.obj files directly and .a archive files.
+        Uses parallel processing with imap_unordered for continuous work distribution.
+
+        :param lib_dir: Directory containing library files
+        :param jobs: Number of parallel workers (-j). Default 1 (sequential).
+        :return: Set of LibMatchDescriptor objects
+        """
         lmds = set()
-        for dirName, subdirList, fileList in os.walk(lib_dir):
-            l.info('Found directory: %s' % dirName)
-            for fname in fileList:
-                if fname.endswith(".o") or fname.endswith(".obj"):
+        temp_dirs = []  # Track temp directories for cleanup
+        files_to_process = []  # Collect all files first
+
+        try:
+            # Phase 1: Collect all files to process (extract archives in main process)
+            for dirName, subdirList, fileList in os.walk(lib_dir):
+                l.info('Found directory: %s' % dirName)
+                for fname in fileList:
                     fullfname = os.path.join(dirName, fname)
-                    l.info("Making signature for " + fullfname)
-                    try:
-                        lmds.add(LibMatchDescriptor.make_signature(fullfname, **PROJECT_KWARGS))
-                    except angr.errors.AngrCFGError:
-                        l.warning("No executable data for %s, skipping" % fullfname)
-                    except Exception as e:
-                        l.exception("Could not make signature for " + fullfname)
+
+                    # Handle .o and .obj files directly
+                    if fname.endswith(".o") or fname.endswith(".obj"):
+                        files_to_process.append(fullfname)
+
+                    # Handle .a archive files - extract in main process
+                    elif fname.endswith(".a"):
+                        l.info(f"Extracting archive: {fullfname}")
+                        temp_dir = tempfile.mkdtemp(prefix="libmatch_ar_")
+                        temp_dirs.append(temp_dir)
+                        extracted_files = LibMatchDatabase._extract_archive(fullfname, temp_dir)
+                        files_to_process.extend(extracted_files)
+
+            total_files = len(files_to_process)
+            l.info(f"Collected {total_files} object files to process")
+
+            if total_files == 0:
+                return lmds
+
+            # Phase 2: Process files (parallel or sequential)
+            if jobs > 1 and total_files > 1:
+                l.info(f"Building LMDs in parallel with {jobs} workers (-j{jobs})")
+                start_time = time.time()
+                processed = 0
+                successful = 0
+
+                with Pool(processes=jobs) as pool:
+                    # imap_unordered returns results as soon as workers finish
+                    # No waiting for batches - continuous work distribution
+                    for filepath, lmd in pool.imap_unordered(_build_lmd_worker, files_to_process):
+                        processed += 1
+                        if lmd is not None:
+                            lmds.add(lmd)
+                            successful += 1
+
+                        # Progress logging every 10% or every 50 files
+                        if processed % max(1, total_files // 10) == 0 or processed % 50 == 0:
+                            elapsed = time.time() - start_time
+                            rate = processed / elapsed if elapsed > 0 else 0
+                            _log_perf(f"Progress: {processed}/{total_files} ({100*processed//total_files}%)",
+                                     extra=f"| {successful} successful | {rate:.1f} files/sec")
+
+                elapsed = time.time() - start_time
+                l.info(f"Parallel build complete: {successful}/{total_files} successful in {elapsed:.1f}s")
+            else:
+                # Sequential mode (default, -j1)
+                l.info("Building LMDs sequentially (-j1)")
+                for fullfname in files_to_process:
+                    l.info(f"Making signature for {os.path.basename(fullfname)}")
+                    LibMatchDatabase._process_object_file(fullfname, lmds)
+
+        finally:
+            # Clean up temp directories after all processing is done
+            for temp_dir in temp_dirs:
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception as e:
+                    l.warning(f"Failed to clean up temp directory {temp_dir}: {e}")
+
         return lmds
 
     @staticmethod
-    def build(root_dir):
+    def build(root_dir, output_path=None, jobs=1):
         """
         Constructor to build the database, from a directory tree
 
-        :param root_dir:
+        :param root_dir: Directory containing library subdirectories
+        :param output_path: Optional output path for the LMDB file. If None, saves to {parent_dir}/{root_dir_name}.lmdb
+        :param jobs: Number of parallel workers (-j). Default 1 (sequential).
         :return: the LMDB
         """
         lmds = dict() # mapping of the lib's name, to the list of lmds it contains
         if not os.path.isdir(root_dir):
             raise ValueError("Must provide a directory to build a database!")
+
+        l.info(f"Building database with -j{jobs}")
+
         # Divide each folder within the directory into libraries
         for thing in os.listdir(root_dir):
             fullname = os.path.join(root_dir, thing)
             if os.path.isdir(fullname):
                 l.info("Building signatures for library %s (%s)" % (thing, fullname))
-                lmds[thing] = LibMatchDatabase._build_lib(fullname)
+                lmds[thing] = LibMatchDatabase._build_lib(fullname, jobs=jobs)
 
         l.info("Making LMDB")
         lmdb = LibMatchDatabase(lmds)
-        directory = os.path.dirname(os.path.abspath(root_dir))
-        filename = os.path.basename(os.path.abspath(root_dir)) + ".lmdb"
-        lmdb.dump_path(os.path.join(directory, filename))
+        if output_path is None:
+            directory = os.path.dirname(os.path.abspath(root_dir))
+            filename = os.path.basename(os.path.abspath(root_dir)) + ".lmdb"
+            output_path = os.path.join(directory, filename)
+        lmdb.dump_path(output_path)
         l.info("Done")
 
     def _build_sym_list(self, lmds):
@@ -230,8 +415,25 @@ class LibMatchDatabase(object):
         return lmdb
 
     def dump_path(self, p):
-        with open(p, "wb") as f:
-            self.dump(f)
+        l.info(f"Dumping LMDB to {p}...")
+        try:
+            with open(p, "wb") as f:
+                self.dump(f)
+                f.flush()
+                os.fsync(f.fileno())  # Force OS to write to disk
+
+            # Verify the file is a complete pickle (ends with STOP opcode)
+            with open(p, "rb") as f:
+                f.seek(-1, 2)  # Seek to last byte
+                last_byte = f.read(1)
+                if last_byte != b'.':
+                    raise RuntimeError(f"Pickle file incomplete: last byte is {last_byte!r}, expected b'.'")
+
+            file_size = os.path.getsize(p)
+            l.info(f"Successfully dumped LMDB to {p} ({file_size / (1024**3):.2f} GB)")
+        except Exception as e:
+            l.error(f"Failed to dump LMDB: {e}")
+            raise
 
     def dump(self, f):
         return pickle.dump(self, f, pickle.HIGHEST_PROTOCOL)
