@@ -594,12 +594,21 @@ class LibMatchDescriptor(object):
         """O(1) lookup for symbol at address using prebuilt hash table."""
         if hasattr(self, '_addr_to_symbol'):
             return self._addr_to_symbol.get(addr)
+
         # Fallback for old LMD files without the hash table
+        def get_symbol_addr(sym, backend):
+            """Get symbol address, handling missing owner attribute."""
+            try:
+                return sym.rebased_addr
+            except AttributeError:
+                # Owner may not be preserved through pickle, compute manually
+                return sym.relative_addr + backend.mapped_base
+
         for s in self.loader.main_object.symbols:
-            if s.rebased_addr == addr:
+            if get_symbol_addr(s, self.loader.main_object) == addr:
                 return s
         for s in self.loader.extern_object.symbols:
-            if s.rebased_addr == addr:
+            if get_symbol_addr(s, self.loader.extern_object) == addr:
                 return s
 
     # Creation and Serialization
